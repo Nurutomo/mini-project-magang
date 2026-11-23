@@ -30,6 +30,16 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Cache PlatformIO packages and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: platformio-${{ runner.os }}-${{ matrix.env }}-${{ hashFiles('platformio.ini', 'partitions.csv', 'src/**', 'include/**', 'lib/**') }}
+          restore-keys: |
+            platformio-${{ runner.os }}-${{ matrix.env }}-
+
       - name: Install PlatformIO
         run: pip install platformio
 
