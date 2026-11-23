@@ -182,6 +182,9 @@
 #ifndef MQTT_CONFIG_PORT_KEY
 #define MQTT_CONFIG_PORT_KEY "port"
 #endif
+#ifndef MQTT_CONFIG_TOPIC_KEY
+#define MQTT_CONFIG_TOPIC_KEY "topic"
+#endif
 #ifndef MQTT_CONFIG_USER_KEY
 #define MQTT_CONFIG_USER_KEY "user"
 #endif

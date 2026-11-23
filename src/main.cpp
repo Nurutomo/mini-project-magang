@@ -257,6 +257,7 @@ String serialCommand;
 bool wifiApplyRequested = false;
 String mqttHost = MQTT_HOST;
 uint16_t mqttPort = MQTT_PORT;
+String mqttTopicPrefix = MQTT_TOPIC_PREFIX;
 String mqttUser = MQTT_USER;
 String mqttPassword = MQTT_PASSWORD;
 Preferences mqttPreferences;
@@ -298,6 +299,7 @@ void loadMqttConfig() {
   mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, true);
   mqttHost = mqttPreferences.getString(MQTT_CONFIG_HOST_KEY, MQTT_HOST);
   mqttPort = mqttPreferences.getUShort(MQTT_CONFIG_PORT_KEY, MQTT_PORT);
+  mqttTopicPrefix = mqttPreferences.getString(MQTT_CONFIG_TOPIC_KEY, MQTT_TOPIC_PREFIX);
   mqttUser = mqttPreferences.getString(MQTT_CONFIG_USER_KEY, MQTT_USER);
   mqttPassword = mqttPreferences.getString(MQTT_CONFIG_PASSWORD_KEY, MQTT_PASSWORD);
   mqttPreferences.end();
@@ -418,12 +420,15 @@ void handleWifiCommand(String command) {
   command.trim();
   if (command.startsWith("mesh ")) { handleMeshCommand(command); return; }
   if (command == "mqtt show") {
-    Serial.printf("[mqtt] host=%s port=%u username=%s password=[hidden]\n", mqttHost.c_str(), mqttPort, mqttUser.isEmpty() ? "(none)" : "(set)"); return;
+    Serial.printf("[mqtt] host=%s port=%u topic=%s username=%s password=[hidden]\n",
+                  mqttHost.c_str(), mqttPort, mqttTopicPrefix.c_str(),
+                  mqttUser.isEmpty() ? "(none)" : "(set)"); return;
   }
   if (command == "mqtt save") {
     mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, false);
     mqttPreferences.putString(MQTT_CONFIG_HOST_KEY, mqttHost);
     mqttPreferences.putUShort(MQTT_CONFIG_PORT_KEY, mqttPort);
+    mqttPreferences.putString(MQTT_CONFIG_TOPIC_KEY, mqttTopicPrefix);
     mqttPreferences.putString(MQTT_CONFIG_USER_KEY, mqttUser);
     mqttPreferences.putString(MQTT_CONFIG_PASSWORD_KEY, mqttPassword);
     mqttPreferences.end();
@@ -432,6 +437,30 @@ void handleWifiCommand(String command) {
   if (command == "mqtt clear") {
     mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, false); mqttPreferences.clear(); mqttPreferences.end();
     Serial.println("[mqtt] saved settings removed; reboot to use build defaults"); return;
+  }
+  if (command.startsWith("mqtt topic ")) {
+    String prefix = command.substring(11);
+    prefix.trim();
+    bool validPrefix = !prefix.isEmpty() && prefix.length() <= 200 &&
+        prefix[0] != '/' && prefix[prefix.length() - 1] != '/';
+    bool segmentHasCharacter = false;
+    for (size_t i = 0; i < prefix.length(); ++i) {
+      const char c = prefix[i];
+      const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '/';
+      if (!allowed) validPrefix = false;
+      if (c == '/') {
+        if (!segmentHasCharacter) validPrefix = false;
+        segmentHasCharacter = false;
+      } else segmentHasCharacter = true;
+    }
+    if (!validPrefix || !segmentHasCharacter) {
+      Serial.println("[mqtt] invalid topic prefix; use 1..200 chars of letters, digits, '.', '_' or '-' separated by '/', with no empty segments");
+      return;
+    }
+    mqttTopicPrefix = prefix;
+    Serial.println("[mqtt] topic prefix updated; use 'mqtt save' to persist");
+    return;
   }
   if (command.startsWith("mqtt set ")) {
     String fields = command.substring(9); fields.trim();
@@ -467,7 +496,7 @@ void handleWifiCommand(String command) {
     Serial.println("wifi ca <single-line PEM; replace newlines with \\n> | wifi ca clear");
     Serial.println("wifi scan | wifi save | wifi apply | wifi show | wifi clear");
     Serial.println("mqtt set <host> <port> [username password]");
-    Serial.println("mqtt show | mqtt save | mqtt clear");
+    Serial.println("mqtt topic <prefix> | mqtt show | mqtt save | mqtt clear");
     Serial.println("Fields are space-separated. Your serial terminal may echo typed credentials.");
     return;
   }
@@ -1265,7 +1294,7 @@ void reconnectMqtt() {
   String clientId = String(MQTT_CLIENT_ID);
   if (clientId.isEmpty()) clientId = String("ussc-gateway-") + WiFi.macAddress();
   clientId.replace(":", "");
-  const String statusTopic = String(MQTT_TOPIC_PREFIX) + "/gateway/status";
+  const String statusTopic = mqttTopicPrefix + "/gateway/status";
   const bool ok = !mqttUser.isEmpty()
       ? mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str(), statusTopic.c_str(), 1, true, "offline")
       : mqttClient.connect(clientId.c_str(), statusTopic.c_str(), 1, true, "offline");
@@ -1311,7 +1340,7 @@ void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac, int8
   if (packet.flags & FLAG_WIND_VALID) doc["wind_input_v"] = packet.windMilliVolts / 1000.0f;
   char payload[320];
   const size_t len = serializeJson(doc, payload, sizeof(payload));
-  const String topic = String(MQTT_TOPIC_PREFIX) + "/" + packet.nodeId + "/state";
+  const String topic = mqttTopicPrefix + "/" + packet.nodeId + "/state";
   if (mqttClient.connected()) {
     const bool ok = mqttClient.publish(topic.c_str(), reinterpret_cast<const uint8_t *>(payload), len, false);
     Serial.printf("[gateway] %s topic=%s payload=%s\n", ok ? "published" : "publish failed", topic.c_str(), payload);
