@@ -6,7 +6,11 @@
 #include <esp_wifi.h>
 #include <esp_sleep.h>
 #include <esp_mac.h>
+#if CONFIG_IDF_TARGET_ESP32C3
+#include <driver/usb_serial_jtag.h>
+#endif
 #include <math.h>
+#include <stddef.h>
 #include <string.h>
 #include <ArduinoJson.h>
 
@@ -30,10 +34,24 @@ constexpr uint32_t SENSOR_SETTLE_MS = 4;
 
 #if STATUS_LED_PIN >= 0
 volatile uint8_t statusLedPendingPulses = 0;
+portMUX_TYPE statusLedMux = portMUX_INITIALIZER_UNLOCKED;
 bool statusLedOn = false;
 bool statusLedGap = false;
 uint32_t statusLedNextTransitionMs = 0;
 #endif
+
+uint8_t runtimeMeshChannel = ESPNOW_CHANNEL;
+uint32_t runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
+uint32_t runtimeBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
+uint32_t runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
+
+bool serialConsoleConnected() {
+#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE && CONFIG_IDF_TARGET_ESP32C3
+  return usb_serial_jtag_is_connected();
+#else
+  return true; // UART-connected boards have no reliable host-presence signal.
+#endif
+}
 
 void initStatusLed() {
 #if STATUS_LED_PIN >= 0
@@ -42,12 +60,27 @@ void initStatusLed() {
 #endif
 }
 
+void loadMeshConfig();
+bool saveMeshConfig();
+
+#if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+void pollNodeSerial();
+void applyPendingSyncBeacon();
+void onNodeReceive(const esp_now_recv_info_t *, const uint8_t *, int);
+void serviceNodeMesh();
+void onSampleSend(const esp_now_send_info_t *, esp_now_send_status_t);
+bool publishSample();
+#endif
+#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+void sendSyncBeacon(bool windowOpen);
+#endif
+
 void blinkStatusLed(uint8_t pulses = 1) {
 #if STATUS_LED_PIN >= 0
-  noInterrupts();
+  portENTER_CRITICAL(&statusLedMux);
   const uint16_t queued = static_cast<uint16_t>(statusLedPendingPulses) + pulses;
   statusLedPendingPulses = static_cast<uint8_t>(queued > 20 ? 20 : queued);
-  interrupts();
+  portEXIT_CRITICAL(&statusLedMux);
 #else
   (void)pulses;
 #endif
@@ -64,9 +97,9 @@ void serviceStatusLed() {
   }
   if (!statusLedOn && statusLedPendingPulses &&
       (!statusLedGap || static_cast<int32_t>(now - statusLedNextTransitionMs) >= 0)) {
-    noInterrupts();
+    portENTER_CRITICAL(&statusLedMux);
     if (statusLedPendingPulses) --statusLedPendingPulses;
-    interrupts();
+    portEXIT_CRITICAL(&statusLedMux);
     digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? HIGH : LOW);
     statusLedOn = true;
     statusLedGap = false;
@@ -74,6 +107,125 @@ void serviceStatusLed() {
   }
 #endif
 }
+
+RTC_DATA_ATTR uint8_t rtcMeshChannel = ESPNOW_CHANNEL;
+RTC_DATA_ATTR uint32_t rtcSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
+RTC_DATA_ATTR uint32_t rtcBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
+RTC_DATA_ATTR uint32_t rtcActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
+RTC_DATA_ATTR uint32_t lastSyncSleepMs = 0;
+RTC_DATA_ATTR uint16_t missedSyncCount = 0;
+
+struct __attribute__((packed)) MeshConfigRecord {
+  uint8_t version;
+  uint8_t channel;
+  uint32_t sensorIntervalMs;
+  uint32_t beaconIntervalMs;
+  uint32_t activeWindowMs;
+  uint32_t checksum;
+};
+constexpr uint8_t MESH_CONFIG_RECORD_VERSION = 1;
+
+uint32_t meshConfigChecksum(const MeshConfigRecord &record) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&record);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < offsetof(MeshConfigRecord, checksum); ++i) {
+    hash = (hash ^ bytes[i]) * 16777619UL;
+  }
+  return hash;
+}
+
+void loadMeshConfig() {
+  Preferences meshPreferences;
+  if (meshPreferences.begin("mesh", true)) {
+    MeshConfigRecord record{};
+    const bool hasAtomicRecord = meshPreferences.getBytesLength("config_v1") == sizeof(record) &&
+        meshPreferences.getBytes("config_v1", &record, sizeof(record)) == sizeof(record) &&
+        record.version == MESH_CONFIG_RECORD_VERSION &&
+        record.checksum == meshConfigChecksum(record);
+    if (hasAtomicRecord) {
+      runtimeMeshChannel = record.channel;
+      runtimeSensorIntervalMs = record.sensorIntervalMs;
+      runtimeBeaconIntervalMs = record.beaconIntervalMs;
+      runtimeActiveWindowMs = record.activeWindowMs;
+    } else if (!meshPreferences.isKey("config_v1") && meshPreferences.isKey("channel")) {
+      runtimeMeshChannel = meshPreferences.getUChar("channel", runtimeMeshChannel);
+      runtimeSensorIntervalMs = meshPreferences.getUInt("sensor_ms", runtimeSensorIntervalMs);
+      runtimeBeaconIntervalMs = meshPreferences.getUInt("beacon_ms", runtimeBeaconIntervalMs);
+      runtimeActiveWindowMs = meshPreferences.getUInt("active_ms", runtimeActiveWindowMs);
+    }
+    meshPreferences.end();
+  }
+  if (runtimeMeshChannel < 1 || runtimeMeshChannel > 13) runtimeMeshChannel = ESPNOW_CHANNEL;
+  if (runtimeSensorIntervalMs < 10000 || runtimeSensorIntervalMs > 86400000UL)
+    runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
+  if (runtimeActiveWindowMs < 500 || runtimeActiveWindowMs > 10000)
+    runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
+  if (runtimeSensorIntervalMs <= runtimeActiveWindowMs)
+    runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL > runtimeActiveWindowMs
+        ? SAMPLE_INTERVAL_S * 1000UL : runtimeActiveWindowMs + 10000UL;
+  if (runtimeBeaconIntervalMs < 100 || runtimeBeaconIntervalMs > 60000 ||
+      runtimeBeaconIntervalMs > runtimeActiveWindowMs / 2) {
+    runtimeBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
+    if (runtimeBeaconIntervalMs > runtimeActiveWindowMs / 2)
+      runtimeBeaconIntervalMs = runtimeActiveWindowMs / 2;
+    if (runtimeBeaconIntervalMs < 100) runtimeBeaconIntervalMs = 100;
+  }
+  rtcMeshChannel = runtimeMeshChannel;
+  rtcSensorIntervalMs = runtimeSensorIntervalMs;
+  rtcBeaconIntervalMs = runtimeBeaconIntervalMs;
+  rtcActiveWindowMs = runtimeActiveWindowMs;
+}
+
+bool saveMeshConfig() {
+  Preferences meshPreferences;
+  if (!meshPreferences.begin("mesh", false)) return false;
+  MeshConfigRecord record{};
+  record.version = MESH_CONFIG_RECORD_VERSION;
+  record.channel = runtimeMeshChannel;
+  record.sensorIntervalMs = runtimeSensorIntervalMs;
+  record.beaconIntervalMs = runtimeBeaconIntervalMs;
+  record.activeWindowMs = runtimeActiveWindowMs;
+  record.checksum = meshConfigChecksum(record);
+  const size_t bytesWritten = meshPreferences.putBytes("config_v1", &record, sizeof(record));
+  const bool saved = bytesWritten == sizeof(record);
+  meshPreferences.end();
+  if (!saved) return false;
+  rtcMeshChannel = runtimeMeshChannel;
+  rtcSensorIntervalMs = runtimeSensorIntervalMs;
+  rtcBeaconIntervalMs = runtimeBeaconIntervalMs;
+  rtcActiveWindowMs = runtimeActiveWindowMs;
+  return true;
+}
+
+#if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+portMUX_TYPE syncBeaconMux = portMUX_INITIALIZER_UNLOCKED;
+SyncBeacon pendingSyncBeacon{};
+volatile bool hasPendingSyncBeacon = false;
+bool nodeSynced = false;
+bool nodeWindowOpen = false;
+bool nodeSentThisWindow = false;
+bool nodeConsoleEnabled = false;
+bool nodeRadioReady = false;
+uint8_t nodeRadioChannel = 0;
+RTC_DATA_ATTR uint8_t channelScanCandidate = 1;
+uint32_t lastChannelScanMs = 0;
+uint32_t nodeNextSlotAt = 0;
+uint32_t nodeTransmitAt = 0;
+uint32_t nodeWakeStartedMs = 0;
+uint32_t nodeWindowStartedAt = 0;
+uint32_t nodeWindowEndsAt = 0;
+uint32_t nodeInitialJitterMs = 0;
+String nodeSerialCommand;
+#endif
+
+#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+uint32_t gatewayNextBeaconAt = 0;
+uint32_t gatewayNextSensorSlotAt = 0;
+uint32_t gatewayNextWindowAt = 0;
+uint32_t gatewayWindowOpenedAt = 0;
+uint32_t gatewayBeaconSequence = 0;
+bool gatewayWindowActive = false;
+#endif
 
 String deviceId() {
   if (strlen(NODE_ID) > 0) return String(NODE_ID);
@@ -157,8 +309,84 @@ void loadWifiConfig() {
   if (wifiConfig.enterprise && wifiConfig.identity.isEmpty()) wifiConfig.identity = wifiConfig.username;
 }
 
+bool saveMeshConfig();
+
+void handleMeshCommand(String command) {
+  command.trim();
+  const uint8_t previousChannel = runtimeMeshChannel;
+  const uint32_t previousSensorIntervalMs = runtimeSensorIntervalMs;
+  const uint32_t previousBeaconIntervalMs = runtimeBeaconIntervalMs;
+  const uint32_t previousActiveWindowMs = runtimeActiveWindowMs;
+  if (command == "mesh show") {
+    const uint8_t displayedChannel = WiFi.status() == WL_CONNECTED
+        ? static_cast<uint8_t>(WiFi.channel()) : runtimeMeshChannel;
+    Serial.printf("[mesh] channel=%u sensor_interval_s=%lu beacon_interval_ms=%lu active_window_ms=%lu\n",
+                  displayedChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL),
+                  static_cast<unsigned long>(runtimeBeaconIntervalMs),
+                  static_cast<unsigned long>(runtimeActiveWindowMs));
+    return;
+  }
+  if (!command.startsWith("mesh set ")) return;
+  String fields = command.substring(9); fields.trim();
+  String values[3]; uint8_t count = 0;
+  while (fields.length() && count < 3) {
+    const int split = fields.indexOf(' ');
+    values[count++] = split < 0 ? fields : fields.substring(0, split);
+    if (split < 0) fields = ""; else { fields = fields.substring(split + 1); fields.trim(); }
+  }
+  char *end = nullptr;
+  const long channel = count > 0 ? strtol(values[0].c_str(), &end, 10) : 0;
+  bool valid = count == 3 && fields.isEmpty() && end && !*end && channel >= 1 && channel <= 13;
+  const long sensorSec = count > 1 ? strtol(values[1].c_str(), &end, 10) : 0;
+  valid = valid && end && !*end && sensorSec >= 10 && sensorSec <= 86400 &&
+          sensorSec * 1000L > runtimeActiveWindowMs;
+  const long beaconMs = count > 2 ? strtol(values[2].c_str(), &end, 10) : 0;
+  valid = valid && end && !*end && beaconMs >= 100 && beaconMs <= 60000;
+  if (!valid) {
+    Serial.println("[mesh] usage: mesh set <channel 1..13> <sensor_interval_seconds 10..86400> <beacon_interval_ms 100..1500>");
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED && channel != WiFi.channel()) {
+    Serial.printf("[mesh] channel %ld conflicts with Wi-Fi AP channel %ld; AP channel is authoritative\n",
+                  channel, static_cast<long>(WiFi.channel()));
+    return;
+  }
+  const uint32_t newActiveWindowMs = runtimeActiveWindowMs;
+  if (beaconMs > static_cast<long>(newActiveWindowMs / 2)) {
+    Serial.printf("[mesh] beacon interval must be <= half the active window (%lu ms)\n",
+                  static_cast<unsigned long>(newActiveWindowMs / 2));
+    return;
+  }
+  runtimeMeshChannel = static_cast<uint8_t>(channel);
+  runtimeSensorIntervalMs = static_cast<uint32_t>(sensorSec) * 1000UL;
+  runtimeBeaconIntervalMs = static_cast<uint32_t>(beaconMs);
+  runtimeActiveWindowMs = newActiveWindowMs;
+  if (!saveMeshConfig()) {
+    runtimeMeshChannel = previousChannel;
+    runtimeSensorIntervalMs = previousSensorIntervalMs;
+    runtimeBeaconIntervalMs = previousBeaconIntervalMs;
+    runtimeActiveWindowMs = previousActiveWindowMs;
+    rtcMeshChannel = previousChannel;
+    rtcSensorIntervalMs = previousSensorIntervalMs;
+    rtcBeaconIntervalMs = previousBeaconIntervalMs;
+    rtcActiveWindowMs = previousActiveWindowMs;
+    Serial.println("[mesh] NVS save failed; previous configuration retained");
+  } else {
+    const uint32_t now = millis();
+    if (gatewayWindowActive) {
+      gatewayNextWindowAt = gatewayWindowOpenedAt + runtimeSensorIntervalMs;
+      if (static_cast<int32_t>(now - gatewayNextWindowAt) >= 0)
+        gatewayNextWindowAt = now + runtimeSensorIntervalMs;
+    } else gatewayNextWindowAt = now + runtimeSensorIntervalMs;
+    gatewayNextSensorSlotAt = gatewayWindowActive ? gatewayWindowOpenedAt : gatewayNextWindowAt;
+    gatewayNextBeaconAt = now;
+    Serial.println("[mesh] saved in NVS; new intervals take effect after current window (channel change requires reboot)");
+  }
+}
+
 void handleWifiCommand(String command) {
   command.trim();
+  if (command.startsWith("mesh ")) { handleMeshCommand(command); return; }
   if (command == "mqtt show") {
     Serial.printf("[mqtt] host=%s port=%u username=%s password=[hidden]\n", mqttHost.c_str(), mqttPort, mqttUser.isEmpty() ? "(none)" : "(set)"); return;
   }
@@ -203,6 +431,7 @@ void handleWifiCommand(String command) {
     Serial.println("[mqtt] settings updated (password hidden); use 'mqtt save' to persist"); return;
   }
   if (command == "wifi" || command == "wifi help") {
+    Serial.println("mesh set <channel> <sensor_interval_seconds> <beacon_interval_ms> | mesh show");
     Serial.println("wifi set <ssid> <password>");
     Serial.println("wifi set eduroam <username> <password> [identity]");
     Serial.println("wifi ca <single-line PEM; replace newlines with \\n> | wifi ca clear");
@@ -457,9 +686,12 @@ TelemetryPacket collectTelemetry() {
 
 bool initEspNow(uint8_t channel) {
   WiFi.mode(WIFI_STA);
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect();
-    esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  WiFi.setAutoReconnect(false);
+  const bool stationConnected = WiFi.status() == WL_CONNECTED;
+  if (stationConnected && channel != WiFi.channel()) return false;
+  if (!stationConnected) {
+    WiFi.disconnect(false, false);
+    if (esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) return false;
   }
   if (esp_now_init() != ESP_OK) return false;
   esp_now_peer_info_t peer{};
@@ -471,40 +703,244 @@ bool initEspNow(uint8_t channel) {
 }
 
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+#if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
+void onRelayReceive(const esp_now_recv_info_t *, const uint8_t *data, int len);
+#endif
+
+void onNodeReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (isValidSyncBeacon(data, static_cast<size_t>(len))) {
+    const auto *beacon = reinterpret_cast<const SyncBeacon *>(data);
+    portENTER_CRITICAL(&syncBeaconMux);
+    pendingSyncBeacon = *beacon;
+    hasPendingSyncBeacon = true;
+    portEXIT_CRITICAL(&syncBeaconMux);
+    blinkStatusLed(1);
+    return;
+  }
+#if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
+  if (isValidTelemetryPacket(data, static_cast<size_t>(len))) onRelayReceive(nullptr, data, len);
+#endif
+}
+
+void applyPendingSyncBeacon() {
+  SyncBeacon beacon{};
+  bool pending = false;
+  portENTER_CRITICAL(&syncBeaconMux);
+  if (hasPendingSyncBeacon) { beacon = pendingSyncBeacon; hasPendingSyncBeacon = false; pending = true; }
+  portEXIT_CRITICAL(&syncBeaconMux);
+  if (!pending) return;
+  if (beacon.channel != nodeRadioChannel) {
+    if (esp_wifi_set_channel(beacon.channel, WIFI_SECOND_CHAN_NONE) != ESP_OK) return;
+    if (esp_now_is_peer_exist(BROADCAST_MAC)) esp_now_del_peer(BROADCAST_MAC);
+    esp_now_peer_info_t peer{};
+    memcpy(peer.peer_addr, BROADCAST_MAC, sizeof(BROADCAST_MAC));
+    peer.channel = beacon.channel;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) != ESP_OK) return;
+    nodeRadioChannel = beacon.channel;
+  }
+  const bool newSensorSchedule = !nodeSynced ||
+      beacon.sensor_interval_ms != runtimeSensorIntervalMs ||
+      beacon.active_window_ms != runtimeActiveWindowMs;
+  runtimeMeshChannel = beacon.channel;
+  runtimeSensorIntervalMs = beacon.sensor_interval_ms;
+  runtimeBeaconIntervalMs = beacon.beacon_interval_ms;
+  runtimeActiveWindowMs = beacon.active_window_ms;
+  const bool wasWindowOpen = nodeWindowOpen;
+  nodeWindowOpen = beacon.window_open != 0;
+  const uint32_t now = millis();
+  if (nodeWindowOpen && !wasWindowOpen) {
+    nodeSentThisWindow = false;
+    nodeWindowStartedAt = now;
+    nodeWindowEndsAt = now + beacon.window_remaining_ms;
+    nodeTransmitAt = now + nodeInitialJitterMs + static_cast<uint32_t>(random(5, 25));
+  } else if (nodeWindowOpen) {
+    const uint32_t advertisedEnd = now + beacon.window_remaining_ms;
+    if (static_cast<int32_t>(advertisedEnd - nodeWindowEndsAt) < 0)
+      nodeWindowEndsAt = advertisedEnd;
+  }
+  nodeNextSlotAt = nodeWindowOpen ? nodeWindowEndsAt : now + beacon.remaining_sleep_ms;
+  if (!nodeWindowOpen) {
+    const uint32_t jitter = newSensorSchedule
+        ? nodeInitialJitterMs + static_cast<uint32_t>(random(5, 25)) : 0;
+    nodeTransmitAt = nodeNextSlotAt + jitter;
+  }
+  nodeSynced = true;
+  nodeWakeStartedMs = now;
+  channelScanCandidate = beacon.channel;
+  rtcMeshChannel = beacon.channel;
+  rtcSensorIntervalMs = beacon.sensor_interval_ms;
+  rtcBeaconIntervalMs = beacon.beacon_interval_ms;
+  rtcActiveWindowMs = beacon.active_window_ms;
+  if (missedSyncCount > 0) --missedSyncCount;
+  lastSyncSleepMs = beacon.remaining_sleep_ms;
+  nodeWindowOpen = beacon.window_open != 0;
+  if (!nodeWindowOpen) nodeSentThisWindow = false;
+  else if (beacon.window_remaining_ms == beacon.active_window_ms) nodeSentThisWindow = false;
+  if (nodeConsoleEnabled) Serial.printf("[mesh] sync seq=%lu channel=%u window=%s next=%lums\n",
+      static_cast<unsigned long>(beacon.sequence), beacon.channel,
+      nodeWindowOpen ? "open" : "closed", static_cast<unsigned long>(beacon.remaining_sleep_ms));
+}
+
+void serviceNodeMesh() {
+  if (nodeConsoleEnabled && !serialConsoleConnected()) nodeConsoleEnabled = false;
+  else if (!nodeConsoleEnabled && serialConsoleConnected()) {
+    nodeConsoleEnabled = true;
+    Serial.begin(115200);
+    Serial.printf("[node] console active; channel=%u interval=%lus\n",
+        runtimeMeshChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL));
+  }
+  if (nodeConsoleEnabled) pollNodeSerial();
+  applyPendingSyncBeacon();
+
+  const uint32_t now = millis();
+  if (!nodeSynced && nodeRadioReady && static_cast<uint32_t>(now - nodeWakeStartedMs) >= runtimeActiveWindowMs) {
+    if (nodeConsoleEnabled) {
+      nodeWakeStartedMs = now;
+      nodeRadioChannel = static_cast<uint8_t>((nodeRadioChannel % 13) + 1);
+      channelScanCandidate = nodeRadioChannel;
+      if (nodeRadioReady) esp_now_deinit();
+      nodeRadioReady = false;
+      if (initEspNow(nodeRadioChannel)) {
+        nodeRadioReady = true;
+        esp_now_register_send_cb(onSampleSend);
+        esp_now_register_recv_cb(onNodeReceive);
+      }
+      return;
+    }
+    if (nodeRadioReady) {
+      esp_now_deinit();
+      nodeRadioReady = false;
+    }
+    nodeRadioChannel = static_cast<uint8_t>((nodeRadioChannel % 13) + 1);
+    channelScanCandidate = nodeRadioChannel;
+    if (initEspNow(nodeRadioChannel)) {
+      nodeRadioReady = true;
+      esp_now_register_send_cb(onSampleSend);
+      esp_now_register_recv_cb(onNodeReceive);
+    }
+    nodeWakeStartedMs = now;
+    nodeSynced = false;
+    nodeWindowOpen = false;
+    nodeSentThisWindow = false;
+    if (missedSyncCount < UINT16_MAX) ++missedSyncCount;
+  }
+
+  if (nodeSynced && nodeWindowOpen && !nodeSentThisWindow &&
+      static_cast<int32_t>(now - nodeTransmitAt) >= 0 &&
+      static_cast<int32_t>(now - nodeWindowEndsAt) < 0) {
+    if (publishSample()) nodeSentThisWindow = true;
+    else nodeTransmitAt = millis() + 250UL;
+  }
+  if (nodeSynced && nodeWindowOpen && static_cast<int32_t>(now - nodeWindowEndsAt) >= 0) {
+    nodeWindowOpen = false;
+  }
+
+#if NODE_DEEP_SLEEP
+  const uint32_t awakeLimit = runtimeActiveWindowMs + 1500UL;
+  if (nodeConsoleEnabled) return;
+  if (nodeSynced && !nodeWindowOpen &&
+      static_cast<int32_t>(nodeNextSlotAt - now) > 0) {
+    const uint32_t sleepMs = nodeNextSlotAt - now;
+    lastSyncSleepMs = sleepMs;
+    if (nodeRadioReady) { esp_now_deinit(); nodeRadioReady = false; }
+    WiFi.mode(WIFI_OFF);
+    if (nodeConsoleEnabled) Serial.flush();
+    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
+    esp_deep_sleep_start();
+  }
+  if (!nodeSynced && now - nodeWakeStartedMs >= awakeLimit) {
+    if (nodeConsoleEnabled) return;
+    if (nodeRadioReady) { esp_now_deinit(); nodeRadioReady = false; }
+    WiFi.mode(WIFI_OFF);
+    channelScanCandidate = static_cast<uint8_t>((nodeRadioChannel % 13) + 1);
+    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(runtimeBeaconIntervalMs) * 1000ULL);
+    esp_deep_sleep_start();
+  }
+#endif
+}
+
+void pollNodeSerial() {
+  if (!serialConsoleConnected()) { nodeConsoleEnabled = false; return; }
+  while (Serial.available()) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      nodeSerialCommand.trim();
+      if (nodeSerialCommand.startsWith("mesh set ")) {
+        String args = nodeSerialCommand.substring(9);
+        const int first = args.indexOf(' '), second = args.indexOf(' ', first + 1);
+        if (first > 0 && second > first) {
+          const String channelText = args.substring(0, first);
+          const String intervalText = args.substring(first + 1, second);
+          const String beaconText = args.substring(second + 1);
+          char *end = nullptr;
+          const long channel = strtol(channelText.c_str(), &end, 10);
+          const bool channelValid = end && !*end;
+          const long interval = strtol(intervalText.c_str(), &end, 10);
+          const bool intervalValid = end && !*end;
+          const long beacon = strtol(beaconText.c_str(), &end, 10);
+          const bool beaconValid = end && !*end;
+          if (channelValid && intervalValid && beaconValid && channel >= 1 && channel <= 13 &&
+              interval >= 10 && interval <= 86400 && interval * 1000L > runtimeActiveWindowMs &&
+              beacon >= 100 && beacon <= 60000 && beacon <= runtimeActiveWindowMs / 2) {
+            if (channel != runtimeMeshChannel) Serial.println("[mesh-info] channel change takes effect after reboot");
+            runtimeMeshChannel = static_cast<uint8_t>(channel);
+            runtimeSensorIntervalMs = static_cast<uint32_t>(interval) * 1000UL;
+            runtimeBeaconIntervalMs = static_cast<uint32_t>(beacon);
+            runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
+            if (saveMeshConfig()) Serial.println("[mesh] saved; reboot to apply channel");
+            else Serial.println("[mesh] failed to save configuration");
+          } else Serial.println("[mesh] values out of range; sensor interval must exceed active window and beacon must be 100..1500 ms");
+        } else Serial.println("[mesh] usage: mesh set <channel> <sensor_interval_seconds> <beacon_interval_ms <= 1500>");
+      } else if (nodeSerialCommand == "mesh show") {
+        Serial.printf("[mesh] channel=%u sensor_interval_s=%lu beacon_interval_ms=%lu missed_sync=%u\n",
+                      runtimeMeshChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL),
+                      static_cast<unsigned long>(runtimeBeaconIntervalMs), missedSyncCount);
+      }
+      nodeSerialCommand = "";
+    } else if (nodeSerialCommand.length() < 96) nodeSerialCommand += c;
+    else nodeSerialCommand = "";
+  }
+}
+
 volatile bool sampleSendDone = false;
 volatile esp_now_send_status_t sampleSendStatus = ESP_NOW_SEND_FAIL;
 
 void onSampleSend(const esp_now_send_info_t *, esp_now_send_status_t status) {
   sampleSendStatus = status;
   sampleSendDone = true;
+  if (status == ESP_NOW_SEND_SUCCESS) blinkStatusLed(1);
 }
 
-void publishSample() {
+bool publishSample() {
   const TelemetryPacket packet = collectTelemetry();
-  Serial.printf("[sensor] id=%s seq=%lu lux=", packet.nodeId,
+  if (nodeConsoleEnabled) {
+    Serial.printf("[sensor] id=%s seq=%lu lux=", packet.nodeId,
                 static_cast<unsigned long>(packet.sequence));
   if (packet.flags & FLAG_LUX_VALID) Serial.printf("%.2f lx", packet.luxCenti / 100.0f);
-  else Serial.print("invalid");
-  Serial.print(" batteryTemp=");
-  if (packet.flags & FLAG_NTC_VALID) Serial.printf("%.2f C", packet.batteryTempCentiC / 100.0f);
-  else Serial.print("invalid");
-  Serial.print(" windInput=");
-  if (packet.flags & FLAG_WIND_VALID) Serial.printf("%.3f V", packet.windMilliVolts / 1000.0f);
-  else Serial.print("invalid");
-  Serial.println();
+    else Serial.print("invalid");
+    Serial.print(" batteryTemp=");
+    if (packet.flags & FLAG_NTC_VALID) Serial.printf("%.2f C", packet.batteryTempCentiC / 100.0f);
+    else Serial.print("invalid");
+    Serial.print(" windInput=");
+    if (packet.flags & FLAG_WIND_VALID) Serial.printf("%.3f V", packet.windMilliVolts / 1000.0f);
+    else Serial.print("invalid");
+    Serial.println();
+  }
 
   blinkStatusLed(2);
   sampleSendDone = false;
   const esp_err_t result = esp_now_send(BROADCAST_MAC,
                                         reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
   if (result != ESP_OK) {
-    Serial.printf("[sensor] ESP-NOW enqueue error=%d\n", result);
-    return;
+    if (nodeConsoleEnabled) Serial.printf("[sensor] ESP-NOW enqueue error=%d\n", result);
+    return false;
   }
   const uint32_t started = millis();
   while (!sampleSendDone && millis() - started < 1200) delay(5);
-  Serial.printf("[sensor] ESP-NOW callback=%s\n",
-                sampleSendDone && sampleSendStatus == ESP_NOW_SEND_SUCCESS ? "success" : "failure/timeout");
+  const bool sent = sampleSendDone && sampleSendStatus == ESP_NOW_SEND_SUCCESS;
+  if (nodeConsoleEnabled) Serial.printf("[sensor] ESP-NOW callback=%s\n", sent ? "success" : "failure/timeout");
+  return sent;
 }
 #endif
 
@@ -533,7 +969,6 @@ void onRelayReceive(const esp_now_recv_info_t *, const uint8_t *data, int len) {
   if (!isValidTelemetryPacket(data, static_cast<size_t>(len))) return;
   blinkStatusLed(1);
   RelayItem item{};
-  blinkStatusLed(1);
   memcpy(&item.packet, data, sizeof(TelemetryPacket));
   portENTER_CRITICAL(&relayMux);
   const uint8_t next = static_cast<uint8_t>((relayHead + 1) % GATEWAY_QUEUE_SIZE);
@@ -592,7 +1027,7 @@ NodeDisplayInfo gatewayNodes[GATEWAY_DEDUP_SIZE]{};
 uint8_t gatewayNodeCursor = 0;
 uint8_t gatewayDisplayPage = 0;
 uint32_t gatewayDisplayPageStarted = 0;
-constexpr uint32_t NODE_ONLINE_TIMEOUT_MS = SAMPLE_INTERVAL_S * 3000UL;
+uint32_t nodeOnlineTimeoutMs() { return runtimeSensorIntervalMs * 3UL; }
 volatile uint8_t queueHead = 0, queueTail = 0;
 portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t queueDropped = 0, invalidPackets = 0, gatewayRxCount = 0;
@@ -606,14 +1041,14 @@ uint16_t seenCursor = 0;
 uint8_t countOnlineNodes(uint32_t now) {
   uint8_t count = 0;
   for (const auto &node : gatewayNodes) {
-    if (node.seen && now - node.lastSeenMs <= NODE_ONLINE_TIMEOUT_MS) ++count;
+    if (node.seen && now - node.lastSeenMs <= nodeOnlineTimeoutMs()) ++count;
   }
   return count;
 }
 
 int findDisplayNode(uint8_t ordinal, uint32_t now) {
   for (uint8_t i = 0; i < GATEWAY_DEDUP_SIZE; ++i) {
-    if (gatewayNodes[i].seen && now - gatewayNodes[i].lastSeenMs <= NODE_ONLINE_TIMEOUT_MS) {
+    if (gatewayNodes[i].seen && now - gatewayNodes[i].lastSeenMs <= nodeOnlineTimeoutMs()) {
       if (ordinal-- == 0) return i;
     }
   }
@@ -704,6 +1139,27 @@ bool duplicatePacket(const TelemetryPacket &packet) {
   return false;
 }
 
+void sendSyncBeacon(bool windowOpen) {
+  SyncBeacon beacon{};
+  beacon.magic = SYNC_BEACON_MAGIC;
+  beacon.version = SYNC_BEACON_VERSION;
+  beacon.channel = gatewayRadioChannel;
+  beacon.window_open = windowOpen ? 1 : 0;
+  beacon.sequence = ++gatewayBeaconSequence;
+  const uint32_t now = millis();
+  const int32_t untilWindow = static_cast<int32_t>(gatewayNextWindowAt - now);
+  beacon.remaining_sleep_ms = untilWindow > 0 ? static_cast<uint32_t>(untilWindow) : 0;
+  beacon.sensor_interval_ms = runtimeSensorIntervalMs;
+  beacon.beacon_interval_ms = runtimeBeaconIntervalMs;
+  beacon.active_window_ms = runtimeActiveWindowMs;
+  const int32_t windowRemaining = static_cast<int32_t>(gatewayWindowOpenedAt + runtimeActiveWindowMs - now);
+  beacon.window_remaining_ms = windowOpen && windowRemaining > 0
+      ? static_cast<uint32_t>(windowRemaining) : 0;
+  const esp_err_t result = esp_now_send(BROADCAST_MAC,
+      reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+  if (result == ESP_OK) blinkStatusLed(1);
+}
+
 void reconnectMqtt() {
   if (mqttClient.connected() || mqttHost.isEmpty() || WiFi.status() != WL_CONNECTED) return;
   static uint32_t lastAttempt = 0;
@@ -785,8 +1241,13 @@ void drainGatewayQueue() {
 
 void setup() {
   initStatusLed();
+#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
   Serial.begin(115200);
-  delay(300);
+#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE
+  delay(30);
+#endif
+#endif
+  randomSeed(esp_random());
   Serial.printf("\n[boot] Solar sensor mesh prototype v%s\n", FW_VERSION);
   Serial.printf("[boot] chip=%s rev=%u cpu=%luMHz flash=%luMB\n", ESP.getChipModel(),
                 ESP.getChipRevision(), static_cast<unsigned long>(getCpuFrequencyMhz()),
@@ -804,37 +1265,64 @@ void setup() {
   analogReadResolution(12);
 #endif
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+  loadMeshConfig();
+  nodeConsoleEnabled = serialConsoleConnected();
+  if (nodeConsoleEnabled) {
+    Serial.begin(115200);
+#if defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE
+    delay(30);
+#endif
+  }
+  nodeWakeStartedMs = millis();
+  const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  if (wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
+    nodeSynced = false;
+    missedSyncCount = 0;
+    channelScanCandidate = runtimeMeshChannel;
+  } else {
+    runtimeMeshChannel = rtcMeshChannel;
+    runtimeSensorIntervalMs = rtcSensorIntervalMs;
+    runtimeBeaconIntervalMs = rtcBeaconIntervalMs;
+    runtimeActiveWindowMs = rtcActiveWindowMs;
+  }
+  const String nodeIdForJitter = deviceId();
+  nodeInitialJitterMs = nodeIdForJitter.length() ? static_cast<uint8_t>(nodeIdForJitter[nodeIdForJitter.length() - 1]) % 500U : 0;
+  nodeRadioChannel = (wakeCause == ESP_SLEEP_WAKEUP_TIMER && missedSyncCount > 0 &&
+                      channelScanCandidate >= 1 && channelScanCandidate <= 13)
+      ? channelScanCandidate : runtimeMeshChannel;
+  if (nodeConsoleEnabled) {
+    Serial.printf("[sensor] id=%s starting channel=%u interval=%lus\n",
+                  deviceId().c_str(), runtimeMeshChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL));
+  }
   analogSetPinAttenuation(NTC_ADC_PIN, ADC_11db);
   analogSetPinAttenuation(WIND_ADC_PIN, ADC_11db);
 #if FEATURE_BATTERY_SENSE
   analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
 #endif
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Serial.printf("[sensor] id=%s BH1750=0x%02X channel=%u interval=%us\n",
-                deviceId().c_str(), BH1750_I2C_ADDRESS, ESPNOW_CHANNEL, SAMPLE_INTERVAL_S);
-  Serial.printf("[sensor] ADC ntc=GPIO%u", NTC_ADC_PIN);
+  if (nodeConsoleEnabled) {
+    Serial.printf("[sensor] id=%s BH1750=0x%02X channel=%u interval=%lus\n",
+                  deviceId().c_str(), BH1750_I2C_ADDRESS, runtimeMeshChannel,
+                  static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL));
+    Serial.printf("[sensor] ADC ntc=GPIO%u", NTC_ADC_PIN);
 #if FEATURE_WIND_ADC
-  Serial.printf(" wind=GPIO%u", WIND_ADC_PIN);
+    Serial.printf(" wind=GPIO%u", WIND_ADC_PIN);
 #endif
 #if FEATURE_BATTERY_SENSE
-  Serial.printf(" battery=GPIO%u", BATTERY_ADC_PIN);
+    Serial.printf(" battery=GPIO%u", BATTERY_ADC_PIN);
 #endif
-  Serial.printf(" samples=%u\n", ADC_SAMPLES);
-  if (!initEspNow(ESPNOW_CHANNEL)) Serial.println("[sensor] ESP-NOW initialization failed");
-  else {
-    esp_now_register_send_cb(onSampleSend);
-#if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
-    esp_now_register_recv_cb(onRelayReceive);
-    Serial.println("[sensor] relay receive enabled");
-#endif
-    publishSample();
+    Serial.printf(" samples=%u\n", ADC_SAMPLES);
   }
-#if NODE_DEEP_SLEEP
-  esp_now_deinit();
-  WiFi.mode(WIFI_OFF);
-  esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(SAMPLE_INTERVAL_S) * 1000000ULL);
-  esp_deep_sleep_start();
-#endif
+  nodeSynced = false;
+  nodeWindowOpen = false;
+  nodeSentThisWindow = false;
+  nodeWakeStartedMs = millis();
+  if (initEspNow(nodeRadioChannel)) {
+    nodeRadioReady = true;
+    esp_now_register_send_cb(onSampleSend);
+    esp_now_register_recv_cb(onNodeReceive);
+    if (nodeConsoleEnabled) Serial.printf("[sensor] listening for SYNC_BEACON on channel=%u\n", runtimeMeshChannel);
+  } else if (nodeConsoleEnabled) Serial.println("[sensor] ESP-NOW initialization failed");
 #endif
 
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && !(defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR)
@@ -846,6 +1334,7 @@ void setup() {
 #endif
 
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+  loadMeshConfig();
   loadWifiConfig();
   loadMqttConfig();
   mqttClient.setServer(mqttHost.c_str(), mqttPort);
@@ -885,9 +1374,18 @@ void setup() {
     gatewayRadioChannel = ESPNOW_CHANNEL;
     Serial.printf("[gateway] Wi-Fi unavailable; ESP-NOW channel=%u; MQTT disabled until Wi-Fi joins\n", gatewayRadioChannel);
   }
+  gatewayRadioChannel = WiFi.status() == WL_CONNECTED
+      ? static_cast<uint8_t>(WiFi.channel()) : runtimeMeshChannel;
   if (initEspNow(gatewayRadioChannel)) {
     esp_now_register_recv_cb(onGatewayReceive);
-    Serial.printf("[gateway] ESP-NOW listening channel=%u MQTT=%s:%u\n", gatewayRadioChannel, mqttHost.c_str(), mqttPort);
+    gatewayNextWindowAt = millis() + runtimeSensorIntervalMs;
+    gatewayNextSensorSlotAt = gatewayNextWindowAt;
+    gatewayWindowOpenedAt = 0;
+    gatewayWindowActive = false;
+    gatewayNextBeaconAt = millis();
+    Serial.printf("[gateway] ESP-NOW listening channel=%u sensor interval=%lus beacon=%lums MQTT=%s:%u\n",
+                  gatewayRadioChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL),
+                  static_cast<unsigned long>(runtimeBeaconIntervalMs), mqttHost.c_str(), mqttPort);
   } else Serial.println("[gateway] ESP-NOW initialization failed");
   updateGatewayDisplay(true);
 #endif
@@ -896,23 +1394,30 @@ void setup() {
 void loop() {
   serviceStatusLed();
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
-#if !NODE_DEEP_SLEEP
-  static uint32_t nextSampleAt = 0;
-  if (static_cast<int32_t>(millis() - nextSampleAt) >= 0) {
-    publishSample();
-    nextSampleAt = millis() + static_cast<uint32_t>(SAMPLE_INTERVAL_S) * 1000UL;
-  }
-#endif
+  serviceNodeMesh();
 #endif
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
+#if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+  if (nodeWindowOpen) relayQueuedPackets();
+#else
   relayQueuedPackets();
+#endif
 #endif
 #if (defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR) || (defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY)
   delay(5);
 #endif
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
   pollSerialCommands();
-  if (wifiScanRequested) {
+  const uint32_t scanCheckNow = millis();
+  if (gatewayWindowActive &&
+      static_cast<int32_t>(scanCheckNow - (gatewayWindowOpenedAt + runtimeActiveWindowMs)) >= 0) {
+    gatewayWindowActive = false;
+    if (static_cast<int32_t>(scanCheckNow - gatewayNextWindowAt) >= 0)
+      gatewayNextWindowAt = scanCheckNow + runtimeSensorIntervalMs;
+  }
+  const int32_t scanWindowDelay = static_cast<int32_t>(gatewayNextWindowAt - millis());
+  if (wifiScanRequested && !gatewayWindowActive &&
+      scanWindowDelay > static_cast<int32_t>(runtimeActiveWindowMs + 30000UL)) {
     wifiScanRequested = false;
     Serial.println("[wifi] scanning 2.4 GHz networks...");
     Serial.println("WIFI_SCAN_BEGIN");
@@ -940,6 +1445,33 @@ void loop() {
     }
     WiFi.scanDelete();
   }
+  const uint32_t meshNow = millis();
+  if (wifiScanRequested) {
+    static uint32_t lastScanDeferralLog = 0;
+    if (meshNow - lastScanDeferralLog > 2000) {
+      Serial.println("[wifi] scan deferred until more than 30s outside the next mesh window");
+      lastScanDeferralLog = meshNow;
+    }
+  }
+  if (gatewayWindowActive && static_cast<int32_t>(meshNow - (gatewayWindowOpenedAt + runtimeActiveWindowMs)) >= 0) {
+    gatewayWindowActive = false;
+    if (static_cast<int32_t>(meshNow - gatewayNextWindowAt) >= 0)
+      gatewayNextWindowAt = meshNow + runtimeSensorIntervalMs;
+  }
+  if (!gatewayWindowActive && static_cast<int32_t>(meshNow - gatewayNextWindowAt) >= 0) {
+    gatewayWindowActive = true;
+    gatewayWindowOpenedAt = meshNow;
+    gatewayNextWindowAt += runtimeSensorIntervalMs;
+    if (static_cast<int32_t>(meshNow - gatewayNextWindowAt) >= 0)
+      gatewayNextWindowAt = meshNow + runtimeSensorIntervalMs;
+    gatewayNextSensorSlotAt = gatewayWindowOpenedAt;
+  }
+  if (static_cast<int32_t>(meshNow - gatewayNextBeaconAt) >= 0) {
+    sendSyncBeacon(gatewayWindowActive);
+    gatewayNextBeaconAt += runtimeBeaconIntervalMs;
+    if (static_cast<int32_t>(meshNow - gatewayNextBeaconAt) >= 0)
+      gatewayNextBeaconAt = meshNow + runtimeBeaconIntervalMs;
+  }
   if (wifiApplyRequested) {
     wifiApplyRequested = false;
     mqttClient.disconnect(); WiFi.disconnect(false, false); delay(100);
@@ -950,7 +1482,13 @@ void loop() {
       if (WiFi.status() == WL_CONNECTED) {
         gatewayRadioChannel = static_cast<uint8_t>(WiFi.channel()); gatewayWifiWasConnected = true;
         esp_now_deinit();
-        if (initEspNow(gatewayRadioChannel)) esp_now_register_recv_cb(onGatewayReceive);
+        if (initEspNow(gatewayRadioChannel)) {
+          esp_now_register_recv_cb(onGatewayReceive);
+          gatewayNextWindowAt = millis() + runtimeSensorIntervalMs;
+          gatewayWindowActive = false;
+          gatewayWindowOpenedAt = 0;
+          gatewayNextBeaconAt = millis();
+        }
         configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
         markNtpSyncStarted();
         Serial.printf("[wifi] connected IP=%s channel=%u; NTP and ESP-NOW restarted\n", WiFi.localIP().toString().c_str(), gatewayRadioChannel);
@@ -962,7 +1500,16 @@ void loop() {
       gatewayWifiWasConnected = true;
       const uint8_t newChannel = static_cast<uint8_t>(WiFi.channel());
       if (newChannel != gatewayRadioChannel) {
-        Serial.printf("[gateway] AP channel changed %u -> %u; restart required to rejoin ESP-NOW consistently\n", gatewayRadioChannel, newChannel);
+        Serial.printf("[gateway] AP channel changed %u -> %u; restarting ESP-NOW on the new AP channel\n", gatewayRadioChannel, newChannel);
+        esp_now_deinit();
+        gatewayRadioChannel = newChannel;
+        if (initEspNow(gatewayRadioChannel)) {
+          esp_now_register_recv_cb(onGatewayReceive);
+          gatewayNextWindowAt = millis() + runtimeSensorIntervalMs;
+          gatewayWindowActive = false;
+          gatewayWindowOpenedAt = 0;
+          gatewayNextBeaconAt = millis();
+        } else Serial.println("[gateway] ESP-NOW restart failed after AP channel change");
       }
       configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
       markNtpSyncStarted();

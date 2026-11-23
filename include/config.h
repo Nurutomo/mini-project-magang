@@ -31,30 +31,32 @@
 #define ESPNOW_ENABLE_RELAY 1
 #endif
 #ifndef SAMPLE_INTERVAL_S
-#define SAMPLE_INTERVAL_S 60
+#define SAMPLE_INTERVAL_S 300
+#endif
+#ifndef SYNC_BEACON_INTERVAL_MS
+#define SYNC_BEACON_INTERVAL_MS 1000
+#endif
+#ifndef NODE_ACTIVE_WINDOW_MS
+#define NODE_ACTIVE_WINDOW_MS 3000
 #endif
 #ifndef NODE_DEEP_SLEEP
-#define NODE_DEEP_SLEEP 0
+#define NODE_DEEP_SLEEP 1
 #endif
 
-// Default ESP32-C3 SuperMini I2C wiring; confirm board revision before use.
+// Many ESP32-C3 SuperMini boards wire an active-low onboard LED to GPIO8.
+// I2C defaults to GPIO6/7 to avoid the LED conflict; verify the actual
+// board revision and sensor wiring before use.
 #ifndef I2C_SDA_PIN
-#define I2C_SDA_PIN 8
+#define I2C_SDA_PIN 6
 #endif
 #ifndef I2C_SCL_PIN
-#define I2C_SCL_PIN 9
+#define I2C_SCL_PIN 7
 #endif
 #ifndef STATUS_LED_PIN
-#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
-#define STATUS_LED_PIN 7
-#elif defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
-#define STATUS_LED_PIN 7
-#else
-#define STATUS_LED_PIN 7
-#endif
+#define STATUS_LED_PIN 8
 #endif
 #ifndef STATUS_LED_ACTIVE_HIGH
-#define STATUS_LED_ACTIVE_HIGH 1
+#define STATUS_LED_ACTIVE_HIGH 0
 #endif
 #ifndef BH1750_I2C_ADDRESS
 #define BH1750_I2C_ADDRESS 0x23
