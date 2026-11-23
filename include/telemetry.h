@@ -37,12 +37,14 @@ static constexpr uint8_t FLAG_RELAYED = 1 << 4;
 // Repeated gateway broadcast. remaining_sleep_ms is the time to the next
 // synchronized sensor window, measured when the beacon is assembled.
 static constexpr uint8_t SYNC_BEACON_MAGIC = 0xB8;
-static constexpr uint8_t SYNC_BEACON_VERSION = 1;
+static constexpr uint8_t SYNC_BEACON_VERSION = 2;
 struct __attribute__((packed)) SyncBeacon {
   uint8_t magic;
   uint8_t version;
   uint8_t channel;
   uint8_t window_open;
+  uint8_t next_channel;
+  uint32_t channel_switch_delay_ms;
   uint32_t sequence;
   uint32_t remaining_sleep_ms;
   uint32_t sensor_interval_ms;
@@ -57,6 +59,8 @@ inline bool isValidSyncBeacon(const uint8_t *data, size_t len) {
   return beacon->magic == SYNC_BEACON_MAGIC &&
          beacon->version == SYNC_BEACON_VERSION &&
          beacon->channel >= 1 && beacon->channel <= 13 &&
+         beacon->next_channel >= 1 && beacon->next_channel <= 13 &&
+         beacon->channel_switch_delay_ms <= 60000 &&
          beacon->sensor_interval_ms >= 10000 && beacon->sensor_interval_ms <= 86400000UL &&
          beacon->beacon_interval_ms >= 100 && beacon->beacon_interval_ms <= 60000 &&
          beacon->active_window_ms >= 500 && beacon->active_window_ms <= 10000 &&
@@ -65,6 +69,8 @@ inline bool isValidSyncBeacon(const uint8_t *data, size_t len) {
          beacon->remaining_sleep_ms <= beacon->sensor_interval_ms &&
          beacon->window_remaining_ms <= beacon->active_window_ms &&
          beacon->window_open <= 1 &&
+         (beacon->next_channel == beacon->channel ||
+          beacon->channel_switch_delay_ms >= 1000) &&
          (!beacon->window_open || beacon->window_remaining_ms > 0);
 }
 

@@ -72,7 +72,9 @@ void onSampleSend(const esp_now_send_info_t *, esp_now_send_status_t);
 bool publishSample();
 #endif
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
-void sendSyncBeacon(bool windowOpen);
+bool sendSyncBeacon(bool windowOpen);
+void onGatewayReceive(const esp_now_recv_info_t *, const uint8_t *, int);
+extern uint8_t gatewayRadioChannel;
 #endif
 
 void blinkStatusLed(uint8_t pulses = 1) {
@@ -215,6 +217,11 @@ uint32_t nodeWakeStartedMs = 0;
 uint32_t nodeWindowStartedAt = 0;
 uint32_t nodeWindowEndsAt = 0;
 uint32_t nodeInitialJitterMs = 0;
+RTC_DATA_ATTR bool channelSwitchPending = false;
+RTC_DATA_ATTR uint8_t channelSwitchTarget = 0;
+uint32_t channelSwitchAt = 0;
+RTC_DATA_ATTR uint32_t channelSwitchLastBeaconSequence = 0;
+RTC_DATA_ATTR bool channelSwitchHasBeaconSequence = false;
 String nodeSerialCommand;
 #endif
 
@@ -225,6 +232,10 @@ uint32_t gatewayNextWindowAt = 0;
 uint32_t gatewayWindowOpenedAt = 0;
 uint32_t gatewayBeaconSequence = 0;
 bool gatewayWindowActive = false;
+bool gatewayChannelChangePending = false;
+uint8_t gatewayPendingChannel = ESPNOW_CHANNEL;
+uint32_t gatewayChannelSwitchAt = 0;
+constexpr uint32_t GATEWAY_CHANNEL_ANNOUNCE_MS = 15000;
 #endif
 
 String deviceId() {
@@ -357,11 +368,23 @@ void handleMeshCommand(String command) {
                   static_cast<unsigned long>(newActiveWindowMs / 2));
     return;
   }
+  if (channel != previousChannel) {
+    gatewayChannelChangePending = true;
+    gatewayPendingChannel = static_cast<uint8_t>(channel);
+    gatewayChannelSwitchAt = millis() + GATEWAY_CHANNEL_ANNOUNCE_MS;
+  } else if (channel == previousChannel) {
+    gatewayChannelChangePending = false;
+    gatewayPendingChannel = previousChannel;
+    gatewayChannelSwitchAt = 0;
+  }
   runtimeMeshChannel = static_cast<uint8_t>(channel);
   runtimeSensorIntervalMs = static_cast<uint32_t>(sensorSec) * 1000UL;
   runtimeBeaconIntervalMs = static_cast<uint32_t>(beaconMs);
   runtimeActiveWindowMs = newActiveWindowMs;
   if (!saveMeshConfig()) {
+    gatewayChannelChangePending = false;
+    gatewayPendingChannel = previousChannel;
+    gatewayChannelSwitchAt = 0;
     runtimeMeshChannel = previousChannel;
     runtimeSensorIntervalMs = previousSensorIntervalMs;
     runtimeBeaconIntervalMs = previousBeaconIntervalMs;
@@ -380,7 +403,12 @@ void handleMeshCommand(String command) {
     } else gatewayNextWindowAt = now + runtimeSensorIntervalMs;
     gatewayNextSensorSlotAt = gatewayWindowActive ? gatewayWindowOpenedAt : gatewayNextWindowAt;
     gatewayNextBeaconAt = now;
-    Serial.println("[mesh] saved in NVS; new intervals take effect after current window (channel change requires reboot)");
+    if (gatewayChannelChangePending)
+      Serial.printf("[mesh] saved; announcing channel %u on old channel for %lu ms before switch\n",
+                    gatewayPendingChannel,
+                    static_cast<unsigned long>(GATEWAY_CHANNEL_ANNOUNCE_MS));
+    else
+      Serial.println("[mesh] saved in NVS; new intervals take effect after current window");
   }
 }
 
@@ -739,6 +767,24 @@ void applyPendingSyncBeacon() {
     if (esp_now_add_peer(&peer) != ESP_OK) return;
     nodeRadioChannel = beacon.channel;
   }
+  if (beacon.next_channel != beacon.channel && beacon.channel_switch_delay_ms > 0) {
+    const uint32_t switchAt = millis() + beacon.channel_switch_delay_ms;
+    const uint32_t remainingToWindow = beacon.window_open ? beacon.window_remaining_ms
+        : beacon.remaining_sleep_ms;
+    const bool sequenceChanged = !channelSwitchHasBeaconSequence ||
+        static_cast<int32_t>(beacon.sequence - channelSwitchLastBeaconSequence) > 0;
+    if (sequenceChanged && !beacon.window_open && remainingToWindow >
+        beacon.channel_switch_delay_ms + beacon.active_window_ms + 500UL) {
+      channelSwitchLastBeaconSequence = beacon.sequence;
+      channelSwitchHasBeaconSequence = true;
+      channelSwitchTarget = beacon.next_channel;
+      channelSwitchPending = true;
+      channelSwitchAt = switchAt;
+    }
+  } else if (beacon.next_channel == beacon.channel) {
+    channelSwitchPending = false;
+    channelSwitchHasBeaconSequence = false;
+  }
   const bool newSensorSchedule = !nodeSynced ||
       beacon.sensor_interval_ms != runtimeSensorIntervalMs ||
       beacon.active_window_ms != runtimeActiveWindowMs;
@@ -794,6 +840,36 @@ void serviceNodeMesh() {
   applyPendingSyncBeacon();
 
   const uint32_t now = millis();
+  if (channelSwitchPending && nodeWindowOpen) {
+    const uint32_t remainingToSwitch = channelSwitchAt - now;
+    const uint32_t remainingToWindow = nodeWindowEndsAt - now;
+    if (static_cast<int32_t>(remainingToSwitch) <= 0 ||
+        remainingToSwitch <= remainingToWindow + 500UL) {
+      channelSwitchPending = false;
+      channelSwitchHasBeaconSequence = false;
+    }
+  }
+  if (channelSwitchPending && static_cast<int32_t>(now - channelSwitchAt) >= 0) {
+    channelSwitchSleepDurationMs = 0;
+    if (nodeRadioReady) {
+      esp_now_deinit();
+      nodeRadioReady = false;
+    }
+    nodeRadioChannel = channelSwitchTarget;
+    channelScanCandidate = nodeRadioChannel;
+    nodeSynced = false;
+    nodeWindowOpen = false;
+    nodeSentThisWindow = false;
+    nodeWakeStartedMs = now;
+    channelSwitchPending = false;
+    if (initEspNow(nodeRadioChannel)) {
+      nodeRadioReady = true;
+      esp_now_register_send_cb(onSampleSend);
+      esp_now_register_recv_cb(onNodeReceive);
+    }
+    if (nodeConsoleEnabled)
+      Serial.printf("[mesh] switched to announced channel %u\n", nodeRadioChannel);
+  }
   if (!nodeSynced && nodeRadioReady && static_cast<uint32_t>(now - nodeWakeStartedMs) >= runtimeActiveWindowMs) {
     if (nodeConsoleEnabled) {
       nodeWakeStartedMs = now;
@@ -839,7 +915,7 @@ void serviceNodeMesh() {
 #if NODE_DEEP_SLEEP
   const uint32_t awakeLimit = runtimeActiveWindowMs + 1500UL;
   if (nodeConsoleEnabled) return;
-  if (nodeSynced && !nodeWindowOpen &&
+  if (nodeSynced && !nodeWindowOpen && !channelSwitchPending &&
       static_cast<int32_t>(nodeNextSlotAt - now) > 0) {
     const uint32_t sleepMs = nodeNextSlotAt - now;
     lastSyncSleepMs = sleepMs;
@@ -883,13 +959,18 @@ void pollNodeSerial() {
           if (channelValid && intervalValid && beaconValid && channel >= 1 && channel <= 13 &&
               interval >= 10 && interval <= 86400 && interval * 1000L > runtimeActiveWindowMs &&
               beacon >= 100 && beacon <= 60000 && beacon <= runtimeActiveWindowMs / 2) {
-            if (channel != runtimeMeshChannel) Serial.println("[mesh-info] channel change takes effect after reboot");
+            const uint8_t previousNodeChannel = runtimeMeshChannel;
+            if (channel != previousNodeChannel) Serial.println("[mesh-info] configured channel; gateway announcement takes precedence when received");
             runtimeMeshChannel = static_cast<uint8_t>(channel);
             runtimeSensorIntervalMs = static_cast<uint32_t>(interval) * 1000UL;
             runtimeBeaconIntervalMs = static_cast<uint32_t>(beacon);
             runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
-            if (saveMeshConfig()) Serial.println("[mesh] saved; reboot to apply channel");
-            else Serial.println("[mesh] failed to save configuration");
+            if (saveMeshConfig()) Serial.println("[mesh] saved; reboot to apply local configuration");
+            else {
+              runtimeMeshChannel = previousNodeChannel;
+              rtcMeshChannel = previousNodeChannel;
+              Serial.println("[mesh] failed to save configuration");
+            }
           } else Serial.println("[mesh] values out of range; sensor interval must exceed active window and beacon must be 100..1500 ms");
         } else Serial.println("[mesh] usage: mesh set <channel> <sensor_interval_seconds> <beacon_interval_ms <= 1500>");
       } else if (nodeSerialCommand == "mesh show") {
@@ -1139,12 +1220,16 @@ bool duplicatePacket(const TelemetryPacket &packet) {
   return false;
 }
 
-void sendSyncBeacon(bool windowOpen) {
+bool sendSyncBeacon(bool windowOpen) {
   SyncBeacon beacon{};
   beacon.magic = SYNC_BEACON_MAGIC;
   beacon.version = SYNC_BEACON_VERSION;
   beacon.channel = gatewayRadioChannel;
   beacon.window_open = windowOpen ? 1 : 0;
+  beacon.next_channel = gatewayChannelChangePending ? gatewayPendingChannel : gatewayRadioChannel;
+  const int32_t switchDelay = gatewayChannelChangePending
+      ? static_cast<int32_t>(gatewayChannelSwitchAt - millis()) : 0;
+  beacon.channel_switch_delay_ms = switchDelay > 0 ? static_cast<uint32_t>(switchDelay) : 0;
   beacon.sequence = ++gatewayBeaconSequence;
   const uint32_t now = millis();
   const int32_t untilWindow = static_cast<int32_t>(gatewayNextWindowAt - now);
@@ -1158,6 +1243,7 @@ void sendSyncBeacon(bool windowOpen) {
   const esp_err_t result = esp_now_send(BROADCAST_MAC,
       reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
   if (result == ESP_OK) blinkStatusLed(1);
+  return result == ESP_OK;
 }
 
 void reconnectMqtt() {
@@ -1467,7 +1553,35 @@ void loop() {
     gatewayNextSensorSlotAt = gatewayWindowOpenedAt;
   }
   if (static_cast<int32_t>(meshNow - gatewayNextBeaconAt) >= 0) {
-    sendSyncBeacon(gatewayWindowActive);
+    const bool transitionBeacon = gatewayChannelChangePending;
+    if (sendSyncBeacon(gatewayWindowActive) && transitionBeacon &&
+        static_cast<int32_t>(millis() - gatewayChannelSwitchAt) >= 0) {
+      delay(20);  // Let the final old-channel beacon leave the radio before deinit.
+      if (WiFi.status() == WL_CONNECTED && WiFi.channel() != gatewayPendingChannel) {
+        gatewayChannelChangePending = false;
+        gatewayPendingChannel = gatewayRadioChannel;
+        gatewayChannelSwitchAt = 0;
+        Serial.printf("[gateway] AP is still on channel %u; ESP-NOW migration cancelled\n",
+                      static_cast<unsigned>(WiFi.channel()));
+      } else {
+        esp_now_deinit();
+        gatewayRadioChannel = gatewayPendingChannel;
+        runtimeMeshChannel = gatewayPendingChannel;
+        if (initEspNow(gatewayRadioChannel)) {
+          esp_now_register_recv_cb(onGatewayReceive);
+          gatewayNextWindowAt = millis() + runtimeSensorIntervalMs;
+          gatewayNextSensorSlotAt = gatewayNextWindowAt;
+          gatewayWindowOpenedAt = 0;
+          gatewayWindowActive = false;
+          gatewayChannelChangePending = false;
+          gatewayNextBeaconAt = millis();
+          Serial.printf("[gateway] switched ESP-NOW to channel %u\n", gatewayRadioChannel);
+        } else {
+          gatewayChannelChangePending = false;
+          Serial.println("[gateway] channel switch failed; ESP-NOW is unavailable");
+        }
+      }
+    }
     gatewayNextBeaconAt += runtimeBeaconIntervalMs;
     if (static_cast<int32_t>(meshNow - gatewayNextBeaconAt) >= 0)
       gatewayNextBeaconAt = meshNow + runtimeBeaconIntervalMs;
