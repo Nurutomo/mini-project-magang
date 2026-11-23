@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <Wire.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -18,6 +19,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <sys/time.h>
+#include <esp_rtc_time.h>
+#include <esp_sntp.h>
 #endif
 
 namespace {
@@ -35,27 +39,273 @@ String deviceId() {
 }
 
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+struct WifiConfig { String ssid, password, username, identity, caCert; bool enterprise = false; };
+WifiConfig wifiConfig;
+Preferences wifiPreferences;
+String serialCommand;
+bool wifiApplyRequested = false;
+String mqttHost = MQTT_HOST;
+uint16_t mqttPort = MQTT_PORT;
+String mqttUser = MQTT_USER;
+String mqttPassword = MQTT_PASSWORD;
+Preferences mqttPreferences;
+extern PubSubClient mqttClient;
+bool wifiScanRequested = false;
+uint32_t wifiTimeSyncStartedMs = 0;
+constexpr int64_t TIME_VALID_EPOCH = RTC_TIME_VALID;
+constexpr unsigned long RTC_TIME_SAVE_INTERVAL_MS = 3600000UL;
+RTC_DATA_ATTR int64_t rtcBackupUnixTime = 0;
+RTC_DATA_ATTR uint64_t rtcBackupTimerUs = 0;
+RTC_DATA_ATTR bool rtcBackupValid = false;
 bool beginWifi() {
 #if defined(CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT) && CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT
   // Eduroam is WPA2-Enterprise (typically PEAP/MSCHAPv2), not WPA2-PSK.
-  if (strcmp(WIFI_SSID, "eduroam") == 0) {
-    if (strlen(EDUROAM_USERNAME) == 0 || strlen(EDUROAM_PASSWORD) == 0) {
-      Serial.println("[wifi] eduroam selected but EDUROAM_USERNAME/EDUROAM_PASSWORD is empty");
-      return false;
+  if (wifiConfig.enterprise) {
+    if (wifiConfig.username.isEmpty() || wifiConfig.password.isEmpty()) {
+      Serial.println("[wifi] eduroam username/password missing"); return false;
     }
-    Serial.printf("[wifi] eduroam WPA2-Enterprise user=%s identity=%s\n", EDUROAM_USERNAME, EDUROAM_IDENTITY);
-    if (strlen(EDUROAM_CA_CERT) > 0) {
-      WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, EDUROAM_IDENTITY, EDUROAM_USERNAME, EDUROAM_PASSWORD,
-                 EDUROAM_CA_CERT);
+    Serial.printf("[wifi] connecting WPA2-Enterprise SSID=%s identity=%s\n", wifiConfig.ssid.c_str(), wifiConfig.identity.c_str());
+    if (wifiConfig.caCert.isEmpty()) {
+      WiFi.begin(wifiConfig.ssid.c_str(), WPA2_AUTH_PEAP, wifiConfig.identity.c_str(),
+                 wifiConfig.username.c_str(), wifiConfig.password.c_str());
     } else {
-      WiFi.begin(WIFI_SSID, WPA2_AUTH_PEAP, EDUROAM_IDENTITY, EDUROAM_USERNAME, EDUROAM_PASSWORD);
+      WiFi.begin(wifiConfig.ssid.c_str(), WPA2_AUTH_PEAP, wifiConfig.identity.c_str(),
+                 wifiConfig.username.c_str(), wifiConfig.password.c_str(), wifiConfig.caCert.c_str());
     }
     return true;
   }
+#else
+  if (wifiConfig.enterprise) { Serial.println("[wifi] enterprise support is unavailable in this build"); return false; }
 #endif
-  Serial.printf("[wifi] WPA2-PSK SSID=%s\n", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.printf("[wifi] WPA2-PSK SSID=%s\n", wifiConfig.ssid.c_str());
+  WiFi.begin(wifiConfig.ssid.c_str(), wifiConfig.password.c_str());
   return true;
+}
+
+void loadMqttConfig() {
+  mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, true);
+  mqttHost = mqttPreferences.getString(MQTT_CONFIG_HOST_KEY, MQTT_HOST);
+  mqttPort = mqttPreferences.getUShort(MQTT_CONFIG_PORT_KEY, MQTT_PORT);
+  mqttUser = mqttPreferences.getString(MQTT_CONFIG_USER_KEY, MQTT_USER);
+  mqttPassword = mqttPreferences.getString(MQTT_CONFIG_PASSWORD_KEY, MQTT_PASSWORD);
+  mqttPreferences.end();
+}
+
+void loadWifiConfig() {
+  wifiConfig.ssid = WIFI_SSID;
+  wifiConfig.enterprise = wifiConfig.ssid.equalsIgnoreCase("eduroam");
+  wifiConfig.password = wifiConfig.enterprise ? EDUROAM_PASSWORD : WIFI_PASSWORD;
+  wifiConfig.username = EDUROAM_USERNAME; wifiConfig.identity = EDUROAM_IDENTITY;
+  wifiConfig.caCert = EDUROAM_CA_CERT;
+  wifiPreferences.begin(WIFI_CONFIG_NAMESPACE, true);
+  if (wifiPreferences.isKey(WIFI_CONFIG_SSID_KEY)) {
+    wifiConfig.ssid = wifiPreferences.getString(WIFI_CONFIG_SSID_KEY);
+    wifiConfig.password = wifiPreferences.getString(WIFI_CONFIG_PASSWORD_KEY);
+    wifiConfig.username = wifiPreferences.getString(WIFI_CONFIG_USERNAME_KEY);
+    wifiConfig.identity = wifiPreferences.getString(WIFI_CONFIG_IDENTITY_KEY);
+    wifiConfig.caCert = wifiPreferences.getString(WIFI_CONFIG_CA_CERT_KEY);
+    wifiConfig.enterprise = wifiConfig.ssid.equalsIgnoreCase("eduroam");
+  }
+  wifiPreferences.end();
+  if (wifiConfig.enterprise && wifiConfig.identity.isEmpty()) wifiConfig.identity = wifiConfig.username;
+}
+
+void handleWifiCommand(String command) {
+  command.trim();
+  if (command == "mqtt show") {
+    Serial.printf("[mqtt] host=%s port=%u username=%s password=[hidden]\n", mqttHost.c_str(), mqttPort, mqttUser.isEmpty() ? "(none)" : "(set)"); return;
+  }
+  if (command == "mqtt save") {
+    mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, false);
+    mqttPreferences.putString(MQTT_CONFIG_HOST_KEY, mqttHost);
+    mqttPreferences.putUShort(MQTT_CONFIG_PORT_KEY, mqttPort);
+    mqttPreferences.putString(MQTT_CONFIG_USER_KEY, mqttUser);
+    mqttPreferences.putString(MQTT_CONFIG_PASSWORD_KEY, mqttPassword);
+    mqttPreferences.end();
+    Serial.println("[mqtt] broker settings saved in NVS"); return;
+  }
+  if (command == "mqtt clear") {
+    mqttPreferences.begin(MQTT_CONFIG_NAMESPACE, false); mqttPreferences.clear(); mqttPreferences.end();
+    Serial.println("[mqtt] saved settings removed; reboot to use build defaults"); return;
+  }
+  if (command.startsWith("mqtt set ")) {
+    String fields = command.substring(9); fields.trim();
+    String values[4]; uint8_t count = 0;
+    while (fields.length() && count < 4) {
+      int split = fields.indexOf(' ');
+      values[count++] = split < 0 ? fields : fields.substring(0, split);
+      if (split < 0) fields = ""; else { fields = fields.substring(split + 1); fields.trim(); }
+    }
+    bool validHost = values[0].length() <= 253;
+    for (size_t i = 0; i < values[0].length(); ++i) {
+      const char c = values[0][i];
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '.' || c == '-')) validHost = false;
+    }
+    if (count < 2 || count == 3 || !fields.isEmpty() || !validHost || values[0].isEmpty() ||
+        values[0][0] == '.' || values[0][0] == '-' || values[0][values[0].length() - 1] == '.' ||
+        values[0][values[0].length() - 1] == '-' || (count >= 3 && values[2].length() > 128) ||
+        (count >= 4 && (values[2].isEmpty() || values[2].length() > 128 || values[3].length() > 128))) {
+      Serial.println("[mqtt] usage: mqtt set <host> <port> [username password] (DNS/IPv4 host, tokens without spaces)"); return;
+    }
+    char *end = nullptr; const long port = strtol(values[1].c_str(), &end, 10);
+    if (!end || *end || port < 1 || port > 65535) { Serial.println("[mqtt] port must be 1..65535"); return; }
+    mqttHost = values[0]; mqttPort = static_cast<uint16_t>(port);
+    mqttUser = count >= 3 ? values[2] : ""; mqttPassword = count >= 4 ? values[3] : "";
+    mqttClient.disconnect(); mqttClient.setServer(mqttHost.c_str(), mqttPort);
+    Serial.println("[mqtt] settings updated (password hidden); use 'mqtt save' to persist"); return;
+  }
+  if (command == "wifi" || command == "wifi help") {
+    Serial.println("wifi set <ssid> <password>");
+    Serial.println("wifi set eduroam <username> <password> [identity]");
+    Serial.println("wifi ca <single-line PEM; replace newlines with \\n> | wifi ca clear");
+    Serial.println("wifi scan | wifi save | wifi apply | wifi show | wifi clear");
+    Serial.println("mqtt set <host> <port> [username password]");
+    Serial.println("mqtt show | mqtt save | mqtt clear");
+    Serial.println("Fields are space-separated. Your serial terminal may echo typed credentials.");
+    return;
+  }
+  if (command == "wifi show") {
+    Serial.printf("[wifi] SSID=%s auth=%s password=[hidden]\n", wifiConfig.ssid.c_str(), wifiConfig.enterprise ? "PEAP" : "PSK"); return;
+  }
+  if (command == "wifi save") {
+    if (wifiConfig.ssid.isEmpty()) { Serial.println("[wifi] set a profile first"); return; }
+    if (wifiConfig.enterprise && wifiConfig.identity.isEmpty()) wifiConfig.identity = wifiConfig.username;
+    wifiPreferences.begin(WIFI_CONFIG_NAMESPACE, false);
+    wifiPreferences.putString(WIFI_CONFIG_SSID_KEY, wifiConfig.ssid);
+    wifiPreferences.putString(WIFI_CONFIG_PASSWORD_KEY, wifiConfig.password);
+    wifiPreferences.putString(WIFI_CONFIG_USERNAME_KEY, wifiConfig.username);
+    wifiPreferences.putString(WIFI_CONFIG_IDENTITY_KEY, wifiConfig.identity);
+    wifiPreferences.putString(WIFI_CONFIG_CA_CERT_KEY, wifiConfig.caCert);
+    wifiPreferences.end();
+    Serial.println("[wifi] profile saved in NVS"); return;
+  }
+  if (command == "wifi clear") {
+    wifiPreferences.begin(WIFI_CONFIG_NAMESPACE, false); wifiPreferences.clear(); wifiPreferences.end();
+    Serial.println("[wifi] saved profile removed; reboot to use build defaults"); return;
+  }
+  if (command == "wifi ca clear") {
+    wifiConfig.caCert = "";
+    Serial.println("[wifi] CA removed from active profile; use 'wifi save' to persist"); return;
+  }
+  if (command.startsWith("wifi ca ")) {
+    String certificate = command.substring(8);
+    certificate.replace("\\n", "\n");
+    if (!certificate.startsWith("-----BEGIN CERTIFICATE-----") || !certificate.endsWith("-----END CERTIFICATE-----")) {
+      Serial.println("[wifi] invalid PEM certificate"); return;
+    }
+    if (certificate.length() > 5000) { Serial.println("[wifi] CA certificate too long (max 5000 chars)"); return; }
+    wifiConfig.caCert = certificate;
+    Serial.println("[wifi] CA set; use 'wifi save' to persist"); return;
+  }
+  if (command.startsWith("wifi set eduroam ")) {
+    String fields = command.substring(16); fields.trim();
+    int p1 = fields.indexOf(' ');
+    if (p1 <= 0) { Serial.println("[wifi] usage: wifi set eduroam <username> <password> [identity]"); return; }
+    int p2 = fields.indexOf(' ', p1 + 1);
+    String username = fields.substring(0, p1);
+    String password = p2 < 0 ? fields.substring(p1 + 1) : fields.substring(p1 + 1, p2);
+    String identity = p2 < 0 ? username : fields.substring(p2 + 1);
+    if (username.isEmpty() || password.isEmpty() || password.length() > 63 || identity.isEmpty() || identity.indexOf(' ') >= 0) {
+      Serial.println("[wifi] invalid fields; use single tokens without spaces"); return;
+    }
+    if (username.length() > 128 || identity.length() > 128) {
+      Serial.println("[wifi] username/identity too long (max 128 chars)"); return;
+    }
+    wifiConfig.ssid = "eduroam"; wifiConfig.username = username;
+    wifiConfig.password = password; wifiConfig.identity = identity;
+    wifiConfig.enterprise = true;
+    Serial.println("[wifi] eduroam profile set (password hidden); use 'wifi save' then 'wifi apply'"); return;
+  }
+  if (command.startsWith("wifi set ")) {
+    String fields = command.substring(9); fields.trim();
+    int p = fields.indexOf(' ');
+    if (p <= 0 || p == static_cast<int>(fields.length()) - 1) { Serial.println("[wifi] usage: wifi set <ssid> <password>"); return; }
+    String ssid = fields.substring(0, p);
+    String password = fields.substring(p + 1);
+    if (ssid.length() > 32 || password.length() > 63 || ssid.indexOf(' ') >= 0 || ssid.equalsIgnoreCase("eduroam")) {
+      Serial.println("[wifi] invalid PSK profile; SSID must be space-free (max 32) and not eduroam; password max 63"); return;
+    }
+    wifiConfig.ssid = ssid; wifiConfig.password = password;
+    wifiConfig.username = ""; wifiConfig.identity = ""; wifiConfig.caCert = "";
+    wifiConfig.enterprise = wifiConfig.ssid.equalsIgnoreCase("eduroam");
+    Serial.println("[wifi] PSK profile set (password hidden); use 'wifi save' then 'wifi apply'"); return;
+  }
+  if (command == "wifi scan") {
+    wifiScanRequested = true;
+    Serial.println("[wifi] scan queued"); return;
+  }
+  if (command == "wifi apply") {
+    wifiApplyRequested = true;
+    Serial.println("[wifi] will reconnect with the new profile"); return;
+  }
+  Serial.println("[serial] unknown command; use 'wifi help'");
+}
+
+void pollSerialCommands() {
+  while (Serial.available()) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r' || c == '\n') {
+      if (!serialCommand.isEmpty()) { handleWifiCommand(serialCommand); serialCommand = ""; }
+    } else if (serialCommand.length() < 6000) serialCommand += c;
+    else { serialCommand = ""; Serial.println("[serial] command too long; discarded"); }
+  }
+}
+
+bool currentTimeValid() { return time(nullptr) >= TIME_VALID_EPOCH; }
+
+void restoreRtcTime() {
+  if (!rtcBackupValid || rtcBackupUnixTime < TIME_VALID_EPOCH) return;
+  const uint64_t nowUs = esp_rtc_get_time_us();
+  if (nowUs <= rtcBackupTimerUs) return;
+  const uint64_t elapsedMs = (nowUs - rtcBackupTimerUs) / 1000ULL;
+  if (elapsedMs > 30ULL * 24ULL * 60ULL * 60ULL * 1000ULL) return;
+  timeval tv{};
+  tv.tv_sec = static_cast<time_t>(rtcBackupUnixTime + static_cast<int64_t>(elapsedMs / 1000ULL));
+  tv.tv_usec = static_cast<suseconds_t>((elapsedMs % 1000ULL) * 1000ULL);
+  if (settimeofday(&tv, nullptr) != 0) {
+    Serial.println("[time] failed to restore RTC estimate"); return;
+  }
+  Serial.println("[time] restored approximate RTC time; NTP will correct it");
+}
+
+void markNtpSyncStarted() {
+  wifiTimeSyncStartedMs = millis();
+}
+
+void saveRtcTime() {
+  const time_t now = time(nullptr);
+  if (now < TIME_VALID_EPOCH) return;
+  rtcBackupUnixTime = now;
+  rtcBackupTimerUs = esp_rtc_get_time_us();
+  rtcBackupValid = true;
+}
+
+void pollTimeSync() {
+  static bool ntpConfirmed = false;
+  static bool timeoutReported = false;
+  static uint32_t lastRtcSaveMs = 0;
+  if (WiFi.status() != WL_CONNECTED) { timeoutReported = false; return; }
+
+  if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+    if (!ntpConfirmed) {
+      ntpConfirmed = true;
+      saveRtcTime();
+      lastRtcSaveMs = millis();
+      struct tm now{};
+      if (getLocalTime(&now, 0)) {
+        char formatted[24]; strftime(formatted, sizeof(formatted), "%Y-%m-%d %H:%M:%S UTC", &now);
+        Serial.printf("[time] NTP synchronized; system time=%s\n", formatted);
+      }
+    } else if (millis() - lastRtcSaveMs >= RTC_TIME_SAVE_INTERVAL_MS) {
+      saveRtcTime();
+      lastRtcSaveMs = millis();
+    }
+  } else if (millis() - wifiTimeSyncStartedMs >= TIME_SYNC_TIMEOUT_MS && !timeoutReported) {
+    timeoutReported = true;
+    Serial.printf("[time] NTP not confirmed; %s\n",
+                  currentTimeValid() ? "using approximate RTC time" : "timestamps unavailable");
+  }
 }
 #endif
 
@@ -354,7 +604,7 @@ bool duplicatePacket(const TelemetryPacket &packet) {
 }
 
 void reconnectMqtt() {
-  if (mqttClient.connected() || strlen(MQTT_HOST) == 0 || WiFi.status() != WL_CONNECTED) return;
+  if (mqttClient.connected() || mqttHost.isEmpty() || WiFi.status() != WL_CONNECTED) return;
   static uint32_t lastAttempt = 0;
   if (millis() - lastAttempt < 5000) return;
   lastAttempt = millis();
@@ -362,8 +612,8 @@ void reconnectMqtt() {
   if (clientId.isEmpty()) clientId = String("ussc-gateway-") + WiFi.macAddress();
   clientId.replace(":", "");
   const String statusTopic = String(MQTT_TOPIC_PREFIX) + "/gateway/status";
-  const bool ok = strlen(MQTT_USER) > 0
-      ? mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD, statusTopic.c_str(), 1, true, "offline")
+  const bool ok = !mqttUser.isEmpty()
+      ? mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPassword.c_str(), statusTopic.c_str(), 1, true, "offline")
       : mqttClient.connect(clientId.c_str(), statusTopic.c_str(), 1, true, "offline");
   if (ok) {
     mqttClient.publish(statusTopic.c_str(), "online", true);
@@ -429,6 +679,7 @@ void setup() {
                 static_cast<unsigned long>(ESP.getFlashChipSize() / (1024UL * 1024UL)));
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
   Serial.println("[boot] role=gateway");
+  Serial.println("[serial] enter 'wifi help' to configure Wi-Fi");
 #elif defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY
   Serial.println("[boot] role=sensor-relay");
 #else
@@ -481,6 +732,10 @@ void setup() {
 #endif
 
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+  loadWifiConfig();
+  loadMqttConfig();
+  mqttClient.setServer(mqttHost.c_str(), mqttPort);
+  restoreRtcTime();
 #if FEATURE_OLED
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   if (!gatewayDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
@@ -492,15 +747,15 @@ void setup() {
   }
 #endif
   WiFi.mode(WIFI_STA);
-  if (strlen(WIFI_SSID) > 0) {
-    if (beginWifi()) {
-      const uint32_t started = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) {
-        delay(250);
+  if (wifiConfig.ssid.isEmpty()) {
+    Serial.println("[wifi] no profile configured; use 'wifi set ...' then 'wifi save' and 'wifi apply'");
+  } else if (beginWifi()) {
+    const uint32_t started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) {
+      delay(250);
 #if FEATURE_OLED
-        updateGatewayDisplay();
+      updateGatewayDisplay();
 #endif
-      }
     }
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -509,7 +764,8 @@ void setup() {
     Serial.printf("[gateway] Wi-Fi IP=%s channel=%u (configure all nodes to match)\n",
                   WiFi.localIP().toString().c_str(), gatewayRadioChannel);
     configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
-    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    markNtpSyncStarted();
+    Serial.printf("[time] NTP sync started; valid=%s\n", currentTimeValid() ? "yes" : "no");
     mqttClient.setBufferSize(384);
   } else {
     gatewayRadioChannel = ESPNOW_CHANNEL;
@@ -517,7 +773,7 @@ void setup() {
   }
   if (initEspNow(gatewayRadioChannel)) {
     esp_now_register_recv_cb(onGatewayReceive);
-    Serial.printf("[gateway] ESP-NOW listening channel=%u MQTT=%s:%u\n", gatewayRadioChannel, MQTT_HOST, MQTT_PORT);
+    Serial.printf("[gateway] ESP-NOW listening channel=%u MQTT=%s:%u\n", gatewayRadioChannel, mqttHost.c_str(), mqttPort);
   } else Serial.println("[gateway] ESP-NOW initialization failed");
   updateGatewayDisplay(true);
 #endif
@@ -540,6 +796,52 @@ void loop() {
   delay(5);
 #endif
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+  pollSerialCommands();
+  if (wifiScanRequested) {
+    wifiScanRequested = false;
+    Serial.println("[wifi] scanning 2.4 GHz networks...");
+    Serial.println("WIFI_SCAN_BEGIN");
+    const int16_t count = WiFi.scanNetworks(false, true);
+    if (count < 0) {
+      Serial.printf("[wifi] scan failed (%d)\n", count);
+      Serial.println("WIFI_SCAN_DONE");
+    } else {
+      Serial.printf("[wifi] scan found %d network(s)\n", count);
+      for (int16_t i = 0; i < count; ++i) {
+        JsonDocument scanResult;
+        scanResult["ssid"] = WiFi.SSID(i);
+        scanResult["rssi"] = WiFi.RSSI(i);
+        scanResult["channel"] = WiFi.channel(i);
+        scanResult["secure"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+        Serial.print("WIFI_SCAN_JSON:");
+        serializeJson(scanResult, Serial);
+        Serial.println();
+        Serial.printf("[wifi] network ssid=\"%s\" rssi=%ld dBm auth=%s channel=%ld\n",
+                      WiFi.SSID(i).c_str(), static_cast<long>(WiFi.RSSI(i)),
+                      WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? "open" : "secured",
+                      static_cast<long>(WiFi.channel(i)));
+      }
+      Serial.println("WIFI_SCAN_DONE");
+    }
+    WiFi.scanDelete();
+  }
+  if (wifiApplyRequested) {
+    wifiApplyRequested = false;
+    mqttClient.disconnect(); WiFi.disconnect(false, false); delay(100);
+    wifiConfig.enterprise = wifiConfig.ssid.equalsIgnoreCase("eduroam");
+    if (beginWifi()) {
+      uint32_t started = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) delay(250);
+      if (WiFi.status() == WL_CONNECTED) {
+        gatewayRadioChannel = static_cast<uint8_t>(WiFi.channel()); gatewayWifiWasConnected = true;
+        esp_now_deinit();
+        if (initEspNow(gatewayRadioChannel)) esp_now_register_recv_cb(onGatewayReceive);
+        configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+        markNtpSyncStarted();
+        Serial.printf("[wifi] connected IP=%s channel=%u; NTP and ESP-NOW restarted\n", WiFi.localIP().toString().c_str(), gatewayRadioChannel);
+      } else Serial.println("[wifi] failed; check credentials and 2.4 GHz coverage");
+    }
+  }
   if (WiFi.status() == WL_CONNECTED) {
     if (!gatewayWifiWasConnected) {
       gatewayWifiWasConnected = true;
@@ -548,20 +850,19 @@ void loop() {
         Serial.printf("[gateway] AP channel changed %u -> %u; restart required to rejoin ESP-NOW consistently\n", gatewayRadioChannel, newChannel);
       }
       configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+      markNtpSyncStarted();
+      Serial.println("[time] NTP sync restarted after Wi-Fi reconnect");
     }
     reconnectMqtt();
   } else {
     gatewayWifiWasConnected = false;
-    if (strlen(WIFI_SSID) > 0 && millis() - lastWifiReconnectAttempt >= 15000) {
+    if (!wifiConfig.ssid.isEmpty() && millis() - lastWifiReconnectAttempt >= 15000) {
       lastWifiReconnectAttempt = millis();
-      if (strcmp(WIFI_SSID, "eduroam") == 0) {
-        WiFi.disconnect(false, false);
-        beginWifi();
-      } else {
-        WiFi.reconnect();
-      }
+      WiFi.disconnect(false, false);
+      beginWifi();
     }
   }
+  pollTimeSync();
   mqttClient.loop();
   drainGatewayQueue();
 #if FEATURE_OLED

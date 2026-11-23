@@ -7,13 +7,18 @@
 // Eduroam uses WPA2-Enterprise (PEAP/MSCHAPv2), not a personal Wi-Fi PSK.
 // When WIFI_SSID is exactly "eduroam", set these to your institution credentials.
 // Configure identity as required by your institution; often same as username.
+// Alternatively, connect to serial at 115200 and run:
+//   wifi set eduroam <username> <password> [identity]
+//   wifi ca <PEM certificate on one line>
+//   wifi save
+// For WPA2-PSK use: wifi set <ssid> <password>, then wifi save.
 #define EDUROAM_USERNAME "nama.pengguna@institusi.ac.id"
 #define EDUROAM_IDENTITY EDUROAM_USERNAME
 #define EDUROAM_PASSWORD "GANTI-DENGAN-PASSWORD"
 // If your institution requires server certificate validation, insert its CA PEM here.
 // Obtain the correct CA from campus IT; do not disable certificate validation as a shortcut.
 #define EDUROAM_CA_CERT ""
-#define MQTT_HOST "192.168.1.10"
+#define MQTT_HOST "test.mosquitto.org"
 #define MQTT_PORT 1883
 #define MQTT_USER ""
 #define MQTT_PASSWORD ""

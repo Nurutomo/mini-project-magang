@@ -129,11 +129,50 @@
 #ifndef EDUROAM_CA_CERT
 #define EDUROAM_CA_CERT ""
 #endif
+#ifndef WIFI_CONFIG_NAMESPACE
+#define WIFI_CONFIG_NAMESPACE "wifi"
+#endif
+#ifndef WIFI_CONFIG_SSID_KEY
+#define WIFI_CONFIG_SSID_KEY "ssid"
+#endif
+#ifndef WIFI_CONFIG_PASSWORD_KEY
+#define WIFI_CONFIG_PASSWORD_KEY "password"
+#endif
+#ifndef WIFI_CONFIG_USERNAME_KEY
+#define WIFI_CONFIG_USERNAME_KEY "username"
+#endif
+#ifndef WIFI_CONFIG_IDENTITY_KEY
+#define WIFI_CONFIG_IDENTITY_KEY "identity"
+#endif
+#ifndef WIFI_CONFIG_CA_CERT_KEY
+#define WIFI_CONFIG_CA_CERT_KEY "ca_cert"
+#endif
+#ifndef RTC_TIME_VALID
+#define RTC_TIME_VALID 1700000000LL
+#endif
+#ifndef TIME_SYNC_TIMEOUT_MS
+#define TIME_SYNC_TIMEOUT_MS 30000UL
+#endif
 #ifndef MQTT_HOST
-#define MQTT_HOST ""
+#define MQTT_HOST "test.mosquitto.org"
 #endif
 #ifndef MQTT_PORT
 #define MQTT_PORT 1883
+#endif
+#ifndef MQTT_CONFIG_NAMESPACE
+#define MQTT_CONFIG_NAMESPACE "mqtt"
+#endif
+#ifndef MQTT_CONFIG_HOST_KEY
+#define MQTT_CONFIG_HOST_KEY "host"
+#endif
+#ifndef MQTT_CONFIG_PORT_KEY
+#define MQTT_CONFIG_PORT_KEY "port"
+#endif
+#ifndef MQTT_CONFIG_USER_KEY
+#define MQTT_CONFIG_USER_KEY "user"
+#endif
+#ifndef MQTT_CONFIG_PASSWORD_KEY
+#define MQTT_CONFIG_PASSWORD_KEY "password"
 #endif
 #ifndef MQTT_USER
 #define MQTT_USER ""
