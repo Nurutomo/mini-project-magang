@@ -12,7 +12,7 @@
 #elif (!defined(DEVICE_ROLE_SENSOR) || !DEVICE_ROLE_SENSOR) && \
       (!defined(DEVICE_ROLE_RELAY) || !DEVICE_ROLE_RELAY) && \
       (!defined(DEVICE_ROLE_GATEWAY) || !DEVICE_ROLE_GATEWAY)
-#error "Build env:sensor-node, env:relay-node, or env:gateway."
+#error "Build one of the gateway-* or sensor-relay-* environments for esp32c3 or esp32classic."
 #endif
 
 #define FW_VERSION "0.2.0"
@@ -46,6 +46,9 @@
 #endif
 #ifndef BH1750_I2C_ADDRESS
 #define BH1750_I2C_ADDRESS 0x23
+#endif
+#ifndef OLED_I2C_ADDRESS
+#define OLED_I2C_ADDRESS 0x3C
 #endif
 
 #ifndef NTC_ADC_PIN
@@ -87,6 +90,13 @@
 #endif
 #ifndef FEATURE_BATTERY_SENSE
 #define FEATURE_BATTERY_SENSE 1
+#endif
+#ifndef FEATURE_OLED
+#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+#define FEATURE_OLED 1
+#else
+#define FEATURE_OLED 0
+#endif
 #endif
 #ifndef BATTERY_DIVIDER_RATIO
 #define BATTERY_DIVIDER_RATIO 2.0f

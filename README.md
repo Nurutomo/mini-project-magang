@@ -6,7 +6,7 @@ Implementasi **baru dari nol** untuk prototipe proposal yang diperluas sesuai di
 
 - **Node sensor:** ESP32-C3 SuperMini, sensor cahaya digital BH1750, NTC 10 kΩ untuk suhu baterai, input ADC dari anemometer dinamo melalui rangkaian proteksi, dan pemantauan tegangan baterai opsional.
 - **Catu daya yang diusulkan:** panel surya 6 V/1 W, dioda Schottky 1N5819, TP4056, baterai 18650 3,7 V, dan regulator HT7333 3,3 V. Susunan dan kompatibilitasnya perlu diverifikasi sebelum dirakit.
-- **Jaringan lokal:** topologi broadcast ESP-NOW dengan image firmware sensor/relay dan relay aplikasi terbatas oleh deduplikasi serta TTL/hop (`pio run -e sensor-node` mengukur sekaligus me-relay; `pio run -e relay-node` hanya me-relay).
+- **Jaringan lokal:** topologi broadcast ESP-NOW dengan image firmware `sensor-relay` (mengukur sekaligus me-relay) dan relay aplikasi terbatas oleh deduplikasi serta TTL/hop.
 - **Gateway:** ESP32 menerima paket dan menerbitkan payload JSON ke broker MQTT melalui Wi-Fi.
 - **Web:** dashboard statis menerima pesan melalui MQTT over WebSocket dan menampilkan lux, suhu baterai, tegangan baterai, tegangan input anemometer, serta daftar node.
 
@@ -31,14 +31,17 @@ mikrokontroler/
 
 Dibutuhkan PlatformIO Core. Pilih environment sesuai fungsi board yang diprogram:
 
+Pilih board (`esp32c3` atau `esp32classic`) dan salah satu dari dua image (`gateway` atau `sensor-relay`):
+
 ```sh
-pio run -e sensor-node  # sensor + relay; gunakan untuk node #1
-pio run -e relay-node   # relay tanpa sensor; gunakan untuk node perantara
-pio run -e gateway      # gateway Wi-Fi / MQTT
+pio run -e gateway-esp32c3          # gateway + OLED untuk ESP32-C3
+pio run -e gateway-esp32classic     # gateway + OLED untuk ESP32 klasik
+pio run -e sensor-relay-esp32c3     # sensor + relay untuk ESP32-C3
+pio run -e sensor-relay-esp32classic # sensor + relay untuk ESP32 klasik
 pio device monitor -b 115200
 ```
 
-Default `pio run` membangun `sensor-node`. Semua node yang berkomunikasi melalui ESP-NOW harus menggunakan kanal yang sama dengan gateway.
+Default `pio run` membangun `gateway-esp32c3`. Gateway menampilkan status Wi-Fi/MQTT, paket diterima, paket invalid, queue drop, dan telemetri terakhir pada OLED SSD1306 I2C 128×64 (alamat default `0x3C`). OLED opsional saat runtime: gateway tetap bekerja bila display tidak terdeteksi. Jalur I2C default C3 adalah SDA GPIO8 / SCL GPIO9, dan ESP32 klasik adalah SDA GPIO21 / SCL GPIO22. Sesuaikan pin/alamat pada build flags atau `include/config.local.h` bila wiring berbeda. Semua node yang berkomunikasi melalui ESP-NOW harus menggunakan kanal yang sama dengan gateway.
 
 1. Salin `include/config.local.example.h` menjadi `include/config.local.h`.
 2. Untuk Wi-Fi biasa, isi `WIFI_SSID` dan `WIFI_PASSWORD`. Jika SSID tepat `eduroam`, firmware gateway otomatis memakai WPA2-Enterprise PEAP dan mengambil `EDUROAM_USERNAME`, `EDUROAM_IDENTITY`, serta `EDUROAM_PASSWORD`; isikan kredensial institusi milikmu. Identitas sering berupa username yang sama, atau format yang ditentukan kampus. Jangan gunakan password akun kampus di tempat selain file lokal yang diabaikan Git; jangan unggah firmware dengan kredensial personal ke publik.
@@ -104,7 +107,7 @@ BH1750 + NTC + dinamo anemometer (ADC terlindungi)
                               web/index.html
 ```
 
-Image `sensor-node` juga mengaktifkan penerusan paket untuk mendukung node #1 yang sekaligus mengukur. Image `relay-node` hanya meneruskan paket; image `gateway` menerima dan menerbitkan MQTT. Relay dilakukan dengan rebroadcast, jitter, pengurangan TTL, penambahan hop, dan cache ID+sequence untuk menekan duplikasi/broadcast storm. Ini **protokol relay demonstrasi sederhana, bukan mesh routing yang resilien**; uji topologi, kehilangan paket, interferensi, dan jangkauan diperlukan.
+Image `sensor-relay` mengukur sekaligus meneruskan paket untuk mendukung node sensor dan relay perantara; image `gateway` menerima paket dan menerbitkan MQTT. Relay dilakukan dengan rebroadcast, jitter, pengurangan TTL, penambahan hop, dan cache ID+sequence untuk menekan duplikasi/broadcast storm. Ini **protokol relay demonstrasi sederhana, bukan mesh routing yang resilien**; uji topologi, kehilangan paket, interferensi, dan jangkauan diperlukan.
 
 Paket radio berversi membawa ID node, nomor urut, uptime, hop, TTL, flags validitas, lux (centilux), suhu (centi-°C), dan tegangan (mV). Gateway melakukan validasi ukuran/header dan deduplikasi sederhana, lalu menerbitkan:
 

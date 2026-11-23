@@ -14,6 +14,8 @@
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
 #include <PubSubClient.h>
 #include <WiFiClient.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <time.h>
 #endif
 
@@ -259,6 +261,9 @@ void relayQueuedPackets() {
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+Adafruit_SSD1306 gatewayDisplay(128, 64, &Wire, -1);
+bool gatewayDisplayReady = false;
+uint32_t displayLastRefresh = 0;
 bool gatewayWifiWasConnected = false;
 uint8_t gatewayRadioChannel = ESPNOW_CHANNEL;
 uint32_t lastWifiReconnectAttempt = 0;
@@ -266,16 +271,45 @@ struct QueueItem { TelemetryPacket packet; uint8_t sourceMac[6]; };
 QueueItem queueItems[GATEWAY_QUEUE_SIZE];
 volatile uint8_t queueHead = 0, queueTail = 0;
 portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
-volatile uint32_t queueDropped = 0, invalidPackets = 0;
+volatile uint32_t queueDropped = 0, invalidPackets = 0, gatewayRxCount = 0;
+char gatewayLastNode[NODE_ID_MAX_LEN] = "-";
+float gatewayLastLux = NAN;
+bool gatewayLastLuxValid = false;
 struct SeenPacket { char nodeId[NODE_ID_MAX_LEN]; uint32_t sequence; };
 SeenPacket seenPackets[GATEWAY_DEDUP_SIZE]{};
 uint16_t seenCursor = 0;
+
+void updateGatewayDisplay(bool force = false) {
+  if (!gatewayDisplayReady) return;
+  if (!force && millis() - displayLastRefresh < 1000) return;
+  displayLastRefresh = millis();
+  gatewayDisplay.clearDisplay();
+  gatewayDisplay.setTextColor(SSD1306_WHITE);
+  gatewayDisplay.setTextSize(1);
+  gatewayDisplay.setCursor(0, 0);
+  gatewayDisplay.println("GATEWAY / DEBUG");
+  gatewayDisplay.printf("WiFi %s ch:%u\n", WiFi.status() == WL_CONNECTED ? "UP" : "DOWN",
+                        gatewayRadioChannel);
+  gatewayDisplay.printf("MQTT %s\n", mqttClient.connected() ? "UP" : "WAIT");
+  gatewayDisplay.printf("RX %lu  QDROP %lu\n", static_cast<unsigned long>(gatewayRxCount),
+                        static_cast<unsigned long>(queueDropped));
+  gatewayDisplay.printf("INVALID %lu\n", static_cast<unsigned long>(invalidPackets));
+  gatewayDisplay.print("Last ");
+  gatewayDisplay.print(gatewayLastNode);
+  if (gatewayLastLuxValid) {
+    gatewayDisplay.print(' ');
+    gatewayDisplay.print(gatewayLastLux, 0);
+    gatewayDisplay.print("lx");
+  }
+  gatewayDisplay.display();
+}
 
 void onGatewayReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (!info || !info->src_addr || !isValidTelemetryPacket(data, static_cast<size_t>(len))) {
     ++invalidPackets;
     return;
   }
+  ++gatewayRxCount;
   QueueItem item{};
   memcpy(&item.packet, data, sizeof(TelemetryPacket));
   memcpy(item.sourceMac, info->src_addr, 6);
@@ -322,6 +356,9 @@ void reconnectMqtt() {
 
 void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac) {
   if (duplicatePacket(packet)) return;
+  snprintf(gatewayLastNode, sizeof(gatewayLastNode), "%s", packet.nodeId);
+  gatewayLastLuxValid = (packet.flags & FLAG_LUX_VALID) != 0;
+  gatewayLastLux = gatewayLastLuxValid ? packet.luxCenti / 100.0f : NAN;
   JsonDocument doc;
   doc["schema"] = 2;
   doc["node_id"] = packet.nodeId;
@@ -373,7 +410,7 @@ void setup() {
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
   Serial.println("[boot] role=gateway");
 #elif defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY
-  Serial.println("[boot] role=relay-node");
+  Serial.println("[boot] role=sensor-relay");
 #else
   Serial.println("[boot] role=sensor-node");
 #endif
@@ -416,11 +453,26 @@ void setup() {
 #endif
 
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+#if FEATURE_OLED
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  if (!gatewayDisplay.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS)) {
+    Serial.println("[gateway] OLED not found; display disabled");
+  } else {
+    gatewayDisplayReady = true;
+    Serial.printf("[gateway] OLED ready at 0x%02X\n", OLED_I2C_ADDRESS);
+    updateGatewayDisplay(true);
+  }
+#endif
   WiFi.mode(WIFI_STA);
   if (strlen(WIFI_SSID) > 0) {
     if (beginWifi()) {
       const uint32_t started = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) delay(250);
+      while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) {
+        delay(250);
+#if FEATURE_OLED
+        updateGatewayDisplay();
+#endif
+      }
     }
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -439,6 +491,7 @@ void setup() {
     esp_now_register_recv_cb(onGatewayReceive);
     Serial.printf("[gateway] ESP-NOW listening channel=%u MQTT=%s:%u\n", gatewayRadioChannel, MQTT_HOST, MQTT_PORT);
   } else Serial.println("[gateway] ESP-NOW initialization failed");
+  updateGatewayDisplay(true);
 #endif
 }
 
@@ -483,6 +536,9 @@ void loop() {
   }
   mqttClient.loop();
   drainGatewayQueue();
+#if FEATURE_OLED
+  updateGatewayDisplay();
+#endif
   static uint32_t lastStats = 0;
   if (millis() - lastStats >= 30000) {
     lastStats = millis();
