@@ -850,7 +850,6 @@ void serviceNodeMesh() {
     }
   }
   if (channelSwitchPending && static_cast<int32_t>(now - channelSwitchAt) >= 0) {
-    channelSwitchSleepDurationMs = 0;
     if (nodeRadioReady) {
       esp_now_deinit();
       nodeRadioReady = false;
