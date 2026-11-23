@@ -62,6 +62,7 @@ void initStatusLed() {
 
 void loadMeshConfig();
 bool saveMeshConfig();
+void configureMaxTxPower();
 
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
 void pollNodeSerial();
@@ -268,6 +269,7 @@ RTC_DATA_ATTR int64_t rtcBackupUnixTime = 0;
 RTC_DATA_ATTR uint64_t rtcBackupTimerUs = 0;
 RTC_DATA_ATTR bool rtcBackupValid = false;
 bool beginWifi() {
+  configureMaxTxPower();
 #if defined(CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT) && CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT
   // Eduroam is WPA2-Enterprise (typically PEAP/MSCHAPv2), not WPA2-PSK.
   if (wifiConfig.enterprise) {
@@ -712,8 +714,18 @@ TelemetryPacket collectTelemetry() {
   return packet;
 }
 
+void configureMaxTxPower() {
+  // ESP-IDF expresses the limit in quarter-dBm units; 78 is 19.5 dBm,
+  // the highest portable setting for the supported ESP32 targets.
+  constexpr int8_t maxTxPowerQuarterDbm = 78;
+  const esp_err_t result = esp_wifi_set_max_tx_power(maxTxPowerQuarterDbm);
+  if (result != ESP_OK)
+    Serial.printf("[wifi] max TX power setup failed (%d)\n", static_cast<int>(result));
+}
+
 bool initEspNow(uint8_t channel) {
   WiFi.mode(WIFI_STA);
+  configureMaxTxPower();
   WiFi.setAutoReconnect(false);
   const bool stationConnected = WiFi.status() == WL_CONNECTED;
   if (stationConnected && channel != WiFi.channel()) return false;
