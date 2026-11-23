@@ -44,6 +44,18 @@
 #ifndef I2C_SCL_PIN
 #define I2C_SCL_PIN 9
 #endif
+#ifndef STATUS_LED_PIN
+#if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
+#define STATUS_LED_PIN 7
+#elif defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
+#define STATUS_LED_PIN 7
+#else
+#define STATUS_LED_PIN 7
+#endif
+#endif
+#ifndef STATUS_LED_ACTIVE_HIGH
+#define STATUS_LED_ACTIVE_HIGH 1
+#endif
 #ifndef BH1750_I2C_ADDRESS
 #define BH1750_I2C_ADDRESS 0x23
 #endif

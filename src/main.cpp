@@ -28,6 +28,53 @@ namespace {
 constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint32_t SENSOR_SETTLE_MS = 4;
 
+#if STATUS_LED_PIN >= 0
+volatile uint8_t statusLedPendingPulses = 0;
+bool statusLedOn = false;
+bool statusLedGap = false;
+uint32_t statusLedNextTransitionMs = 0;
+#endif
+
+void initStatusLed() {
+#if STATUS_LED_PIN >= 0
+  pinMode(STATUS_LED_PIN, OUTPUT);
+  digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
+#endif
+}
+
+void blinkStatusLed(uint8_t pulses = 1) {
+#if STATUS_LED_PIN >= 0
+  noInterrupts();
+  const uint16_t queued = static_cast<uint16_t>(statusLedPendingPulses) + pulses;
+  statusLedPendingPulses = static_cast<uint8_t>(queued > 20 ? 20 : queued);
+  interrupts();
+#else
+  (void)pulses;
+#endif
+}
+
+void serviceStatusLed() {
+#if STATUS_LED_PIN >= 0
+  const uint32_t now = millis();
+  if (statusLedOn && static_cast<int32_t>(now - statusLedNextTransitionMs) >= 0) {
+    digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
+    statusLedOn = false;
+    statusLedGap = true;
+    statusLedNextTransitionMs = now + 45;
+  }
+  if (!statusLedOn && statusLedPendingPulses &&
+      (!statusLedGap || static_cast<int32_t>(now - statusLedNextTransitionMs) >= 0)) {
+    noInterrupts();
+    if (statusLedPendingPulses) --statusLedPendingPulses;
+    interrupts();
+    digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? HIGH : LOW);
+    statusLedOn = true;
+    statusLedGap = false;
+    statusLedNextTransitionMs = now + 70;
+  }
+#endif
+}
+
 String deviceId() {
   if (strlen(NODE_ID) > 0) return String(NODE_ID);
   uint8_t mac[6] = {};
@@ -446,6 +493,7 @@ void publishSample() {
   else Serial.print("invalid");
   Serial.println();
 
+  blinkStatusLed(2);
   sampleSendDone = false;
   const esp_err_t result = esp_now_send(BROADCAST_MAC,
                                         reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
@@ -483,7 +531,9 @@ bool wasRelayed(const TelemetryPacket &packet) {
 
 void onRelayReceive(const esp_now_recv_info_t *, const uint8_t *data, int len) {
   if (!isValidTelemetryPacket(data, static_cast<size_t>(len))) return;
+  blinkStatusLed(1);
   RelayItem item{};
+  blinkStatusLed(1);
   memcpy(&item.packet, data, sizeof(TelemetryPacket));
   portENTER_CRITICAL(&relayMux);
   const uint8_t next = static_cast<uint8_t>((relayHead + 1) % GATEWAY_QUEUE_SIZE);
@@ -513,6 +563,7 @@ void relayQueuedPackets() {
     if (strncmp(packet.nodeId, deviceId().c_str(), NODE_ID_MAX_LEN) == 0 ||
         packet.ttl == 0 || packet.hop >= ESPNOW_TTL || wasRelayed(packet)) continue;
     delay(random(0, RELAY_JITTER_MS));
+    blinkStatusLed(1);
     --packet.ttl;
     ++packet.hop;
     packet.flags |= FLAG_RELAYED;
@@ -534,8 +585,14 @@ uint32_t displayLastRefresh = 0;
 bool gatewayWifiWasConnected = false;
 uint8_t gatewayRadioChannel = ESPNOW_CHANNEL;
 uint32_t lastWifiReconnectAttempt = 0;
-struct QueueItem { TelemetryPacket packet; uint8_t sourceMac[6]; };
+struct QueueItem { TelemetryPacket packet; uint8_t sourceMac[6]; int8_t rssi; };
 QueueItem queueItems[GATEWAY_QUEUE_SIZE];
+struct NodeDisplayInfo { TelemetryPacket packet{}; int8_t rssi = -127; uint32_t lastSeenMs = 0; bool seen = false; };
+NodeDisplayInfo gatewayNodes[GATEWAY_DEDUP_SIZE]{};
+uint8_t gatewayNodeCursor = 0;
+uint8_t gatewayDisplayPage = 0;
+uint32_t gatewayDisplayPageStarted = 0;
+constexpr uint32_t NODE_ONLINE_TIMEOUT_MS = SAMPLE_INTERVAL_S * 3000UL;
 volatile uint8_t queueHead = 0, queueTail = 0;
 portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t queueDropped = 0, invalidPackets = 0, gatewayRxCount = 0;
@@ -546,27 +603,69 @@ struct SeenPacket { char nodeId[NODE_ID_MAX_LEN]; uint32_t sequence; };
 SeenPacket seenPackets[GATEWAY_DEDUP_SIZE]{};
 uint16_t seenCursor = 0;
 
+uint8_t countOnlineNodes(uint32_t now) {
+  uint8_t count = 0;
+  for (const auto &node : gatewayNodes) {
+    if (node.seen && now - node.lastSeenMs <= NODE_ONLINE_TIMEOUT_MS) ++count;
+  }
+  return count;
+}
+
+int findDisplayNode(uint8_t ordinal, uint32_t now) {
+  for (uint8_t i = 0; i < GATEWAY_DEDUP_SIZE; ++i) {
+    if (gatewayNodes[i].seen && now - gatewayNodes[i].lastSeenMs <= NODE_ONLINE_TIMEOUT_MS) {
+      if (ordinal-- == 0) return i;
+    }
+  }
+  return -1;
+}
+
 void updateGatewayDisplay(bool force = false) {
   if (!gatewayDisplayReady) return;
-  if (!force && millis() - displayLastRefresh < 1000) return;
-  displayLastRefresh = millis();
+  const uint32_t now = millis();
+  if (!force && now - displayLastRefresh < 1000) return;
+  displayLastRefresh = now;
+  const uint8_t online = countOnlineNodes(now);
+  if (now - gatewayDisplayPageStarted >= 5000) {
+    gatewayDisplayPageStarted = now;
+    gatewayDisplayPage = online > 1 ? (gatewayDisplayPage + 1) % (online + 1) : 0;
+  }
   gatewayDisplay.clearDisplay();
   gatewayDisplay.setTextColor(SSD1306_WHITE);
   gatewayDisplay.setTextSize(1);
   gatewayDisplay.setCursor(0, 0);
-  gatewayDisplay.println("GATEWAY / DEBUG");
-  gatewayDisplay.printf("WiFi %s ch:%u\n", WiFi.status() == WL_CONNECTED ? "UP" : "DOWN",
-                        gatewayRadioChannel);
-  gatewayDisplay.printf("MQTT %s\n", mqttClient.connected() ? "UP" : "WAIT");
-  gatewayDisplay.printf("RX %lu  QDROP %lu\n", static_cast<unsigned long>(gatewayRxCount),
-                        static_cast<unsigned long>(queueDropped));
-  gatewayDisplay.printf("INVALID %lu\n", static_cast<unsigned long>(invalidPackets));
-  gatewayDisplay.print("Last ");
-  gatewayDisplay.print(gatewayLastNode);
-  if (gatewayLastLuxValid) {
-    gatewayDisplay.print(' ');
-    gatewayDisplay.print(gatewayLastLux, 0);
-    gatewayDisplay.print("lx");
+  if (gatewayDisplayPage > online) gatewayDisplayPage = 0;
+  if (online == 0 || online == 1 || gatewayDisplayPage == 0) {
+    gatewayDisplay.println("GATEWAY STATUS");
+    gatewayDisplay.printf("WiFi: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+    if (WiFi.status() == WL_CONNECTED) {
+      String ssid = WiFi.SSID();
+      if (ssid.length() > 20) ssid = ssid.substring(0, 19) + "~";
+      gatewayDisplay.printf("SSID: %s\n", ssid.c_str());
+    } else gatewayDisplay.println("SSID: --");
+    gatewayDisplay.printf("Channel: %u  MQTT: %s\n", gatewayRadioChannel,
+                          mqttClient.connected() ? "UP" : "DOWN");
+    gatewayDisplay.printf("Nodes online: %u\n", online);
+    gatewayDisplay.printf("RX:%lu Drop:%lu\n", static_cast<unsigned long>(gatewayRxCount),
+                          static_cast<unsigned long>(queueDropped));
+  } else {
+    const int index = findDisplayNode(gatewayDisplayPage - 1, now);
+    if (index >= 0) {
+      const NodeDisplayInfo &node = gatewayNodes[index];
+      const TelemetryPacket &packet = node.packet;
+      gatewayDisplay.printf("NODE %u/%u %s\n", gatewayDisplayPage, online, packet.nodeId);
+      gatewayDisplay.printf("RSSI: %d dBm  hop:%u\n", node.rssi, packet.hop);
+      if (packet.flags & FLAG_LUX_VALID) gatewayDisplay.printf("Light: %.2f lx\n", packet.luxCenti / 100.0f);
+      else gatewayDisplay.println("Light: --");
+      if (packet.flags & FLAG_NTC_VALID) gatewayDisplay.printf("Battery: %.1f C\n", packet.batteryTempCentiC / 100.0f);
+      else gatewayDisplay.println("Battery: --");
+      if (packet.flags & FLAG_BATTERY_VALID) gatewayDisplay.printf("Voltage: %.2f V\n", packet.batteryMilliVolts / 1000.0f);
+      else if (packet.flags & FLAG_WIND_VALID) gatewayDisplay.printf("Wind input: %.2f V\n", packet.windMilliVolts / 1000.0f);
+      else gatewayDisplay.println("Voltage: --");
+      gatewayDisplay.printf("Seq:%lu age:%lus\n", static_cast<unsigned long>(packet.sequence),
+                            static_cast<unsigned long>((now - node.lastSeenMs) / 1000));
+      gatewayDisplay.println("Dist: RSSI needs calibration");
+    }
   }
   gatewayDisplay.display();
 }
@@ -576,10 +675,12 @@ void onGatewayReceive(const esp_now_recv_info_t *info, const uint8_t *data, int 
     ++invalidPackets;
     return;
   }
+  blinkStatusLed(1);
   ++gatewayRxCount;
   QueueItem item{};
   memcpy(&item.packet, data, sizeof(TelemetryPacket));
   memcpy(item.sourceMac, info->src_addr, 6);
+  item.rssi = info->rx_ctrl ? info->rx_ctrl->rssi : -127;
   portENTER_CRITICAL(&queueMux);
   const uint8_t next = static_cast<uint8_t>((queueHead + 1) % GATEWAY_QUEUE_SIZE);
   if (next == queueTail) {
@@ -621,8 +722,20 @@ void reconnectMqtt() {
   } else Serial.printf("[gateway] MQTT connect failed state=%d\n", mqttClient.state());
 }
 
-void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac) {
+void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac, int8_t rssi) {
   if (duplicatePacket(packet)) return;
+  NodeDisplayInfo *nodeInfo = nullptr;
+  for (auto &node : gatewayNodes) {
+    if (node.seen && strncmp(node.packet.nodeId, packet.nodeId, NODE_ID_MAX_LEN) == 0) { nodeInfo = &node; break; }
+  }
+  if (!nodeInfo) {
+    nodeInfo = &gatewayNodes[gatewayNodeCursor++ % GATEWAY_DEDUP_SIZE];
+    *nodeInfo = NodeDisplayInfo{};
+  }
+  nodeInfo->packet = packet;
+  nodeInfo->rssi = rssi;
+  nodeInfo->lastSeenMs = millis();
+  nodeInfo->seen = true;
   snprintf(gatewayLastNode, sizeof(gatewayLastNode), "%s", packet.nodeId);
   gatewayLastLuxValid = (packet.flags & FLAG_LUX_VALID) != 0;
   gatewayLastLux = gatewayLastLuxValid ? packet.luxCenti / 100.0f : NAN;
@@ -633,7 +746,7 @@ void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac) {
   doc["uptime_ms"] = packet.uptimeMs;
   doc["hop"] = packet.hop;
   doc["relayed"] = (packet.flags & FLAG_RELAYED) != 0;
-  doc["rssi_dbm"] = WiFi.RSSI();
+  doc["rssi_dbm"] = rssi;
   doc["gateway_rx_epoch"] = static_cast<uint32_t>(time(nullptr));
   char mac[18];
   snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -664,13 +777,14 @@ void drainGatewayQueue() {
     }
     portEXIT_CRITICAL(&queueMux);
     if (!found) break;
-    publishPacket(item.packet, item.sourceMac);
+    publishPacket(item.packet, item.sourceMac, item.rssi);
   }
 }
 #endif
 } // namespace
 
 void setup() {
+  initStatusLed();
   Serial.begin(115200);
   delay(300);
   Serial.printf("\n[boot] Solar sensor mesh prototype v%s\n", FW_VERSION);
@@ -780,6 +894,7 @@ void setup() {
 }
 
 void loop() {
+  serviceStatusLed();
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
 #if !NODE_DEEP_SLEEP
   static uint32_t nextSampleAt = 0;
