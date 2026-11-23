@@ -124,6 +124,14 @@ Prefix default `unesa/ussc/sensor`. Contoh JSON:
 
 ESP-NOW broadcast ini tidak dienkripsi. Jangan mengirim data sensitif; penambahan peer terenkripsi dan manajemen kunci dibutuhkan sebelum penggunaan lebih luas. Gateway yang terhubung ke AP menggunakan kanal Wi-Fi AP, jadi semua node dan relay harus diprogram dengan kanal tersebut (lihat log gateway), bukan mengandalkan `ESPNOW_CHANNEL` jika nilainya berbeda. Dashboard web memerlukan broker yang menyediakan MQTT over WebSocket (`ws://` atau, disarankan, `wss://`) dan mengizinkan koneksi browser. Kredensial broker di halaman statis tidak rahasia.
 
+## Upload firmware dan serial monitor di web
+
+Dashboard menyediakan uploader firmware dan serial monitor berbasis Web Serial. Buka situs melalui HTTPS (GitHub Pages) di Chrome/Edge desktop, pilih firmware sesuai board, sambungkan board dengan kabel USB data, lalu pilih port dan setujui izin browser. Uploader memeriksa jenis chip sebelum menghapus flash; proses flash menghapus firmware dan data flash lama. Jangan cabut USB saat proses berjalan.
+
+Serial monitor memakai xterm.js pada 115200 baud secara default. Auto-reconnect mencoba membuka kembali port yang sudah diberi izin jika board sempat lepas; browser tetap dapat meminta izin/aksi pengguna setelah perangkat dicabut. Port serial hanya bisa dipegang satu fitur/tab pada satu waktu, jadi tutup sesi serial monitor sebelum upload firmware. MQTT juga memakai auto-reconnect.
+
+Web Serial memerlukan browser yang mendukung API tersebut dan secure context (HTTPS atau localhost); Firefox/Safari belum didukung secara universal. Library esptool-js dan xterm.js dimuat dari jsDelivr.
+
 ## Web dashboard lokal
 
 Untuk mencoba tampilan statis, jalankan server dari folder proyek:
