@@ -114,7 +114,7 @@ jobs:
             cat > "dist/firmware/$env/manifest.json" <<EOF
           {
             "name": "$role ($chip_family)",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "new_install_prompt_erase": true,
             "builds": [{
               "chipFamily": "$chip_family",

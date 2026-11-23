@@ -65,7 +65,7 @@ Default `pio run` membangun `gateway-esp32c3`. Gateway menampilkan status Wi-Fi/
 
 ## Sambungan sensor (rancangan awal, cocokkan dengan board dan modul aktual)
 
-Pin default ESP32-C3 SuperMini: GPIO8 SDA / GPIO9 SCL untuk I2C; GPIO0 NTC; GPIO1 anemometer analog; GPIO3 pemantauan baterai opsional. Pastikan pin tersebut tidak dipakai fungsi board lain. BH1750 umumnya memakai alamat 0x23 (ADDR ke GND) atau 0x5C (ADDR ke VCC).
+Pin default ESP32-C3 SuperMini: GPIO8 SDA / GPIO9 SCL untuk I2C; GPIO0 NTC; GPIO1 anemometer analog; GPIO3 pemantauan baterai opsional. Untuk ESP32 klasik default-nya GPIO21 SDA / GPIO22 SCL; GPIO32 NTC; GPIO33 anemometer; GPIO34 pemantauan baterai. ESP32 klasik hanya memakai pin **ADC1** (GPIO32–39) karena ADC2 tidak dapat dibaca saat Wi-Fi/ESP-NOW aktif; GPIO1/GPIO3 pada board klasik adalah UART0, bukan ADC. Pastikan pin tersebut tidak dipakai fungsi board lain. BH1750 umumnya memakai alamat 0x23 (ADDR ke GND) atau 0x5C (ADDR ke VCC).
 
 ### BH1750
 

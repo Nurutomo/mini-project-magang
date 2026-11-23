@@ -15,7 +15,7 @@
 #error "Build one of the gateway-* or sensor-relay-* environments for esp32c3 or esp32classic."
 #endif
 
-#define FW_VERSION "0.2.0"
+#define FW_VERSION "0.2.1"
 
 #ifndef NODE_ID
 #define NODE_ID ""

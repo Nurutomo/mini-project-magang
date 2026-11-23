@@ -4,6 +4,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_sleep.h>
+#include <esp_mac.h>
 #include <math.h>
 #include <string.h>
 #include <ArduinoJson.h>
@@ -25,8 +26,9 @@ constexpr uint32_t SENSOR_SETTLE_MS = 4;
 
 String deviceId() {
   if (strlen(NODE_ID) > 0) return String(NODE_ID);
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
+  uint8_t mac[6] = {};
+  // Reads the eFuse MAC; unlike WiFi.macAddress() this works before WiFi.mode().
+  if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return String("node-unknown");
   char id[16];
   snprintf(id, sizeof(id), "node-%02X%02X%02X", mac[3], mac[4], mac[5]);
   return String(id);
@@ -61,11 +63,26 @@ uint16_t readAdcMillivolts(uint8_t pin) {
   analogRead(pin); // discard conversion after channel switch
   delay(SENSOR_SETTLE_MS);
   uint32_t total = 0;
+  uint8_t valid = 0;
   for (uint8_t i = 0; i < ADC_SAMPLES; ++i) {
-    total += analogReadMilliVolts(pin);
+    const uint32_t millivolts = analogReadMilliVolts(pin);
+    if (millivolts > 0) {
+      total += millivolts;
+      ++valid;
+    }
     delay(2);
   }
-  return static_cast<uint16_t>(total / ADC_SAMPLES);
+  if (valid == 0) {
+    static uint32_t lastWarnMs = 0;
+    if (millis() - lastWarnMs >= 5000) {
+      lastWarnMs = millis();
+      Serial.printf("[sensor] GPIO%u ADC read failed; check wiring. On classic ESP32 use ADC1 "
+                    "GPIO32-39 because ADC2 (GPIO0/2/4/12-15/25-27) does not work with Wi-Fi.\n",
+                    pin);
+    }
+    return 0;
+  }
+  return static_cast<uint16_t>(total / valid);
 }
 
 bool readBh1750(float &lux) {
@@ -407,6 +424,9 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.printf("\n[boot] Solar sensor mesh prototype v%s\n", FW_VERSION);
+  Serial.printf("[boot] chip=%s rev=%u cpu=%luMHz flash=%luMB\n", ESP.getChipModel(),
+                ESP.getChipRevision(), static_cast<unsigned long>(getCpuFrequencyMhz()),
+                static_cast<unsigned long>(ESP.getFlashChipSize() / (1024UL * 1024UL)));
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
   Serial.println("[boot] role=gateway");
 #elif defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY
@@ -427,6 +447,14 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Serial.printf("[sensor] id=%s BH1750=0x%02X channel=%u interval=%us\n",
                 deviceId().c_str(), BH1750_I2C_ADDRESS, ESPNOW_CHANNEL, SAMPLE_INTERVAL_S);
+  Serial.printf("[sensor] ADC ntc=GPIO%u", NTC_ADC_PIN);
+#if FEATURE_WIND_ADC
+  Serial.printf(" wind=GPIO%u", WIND_ADC_PIN);
+#endif
+#if FEATURE_BATTERY_SENSE
+  Serial.printf(" battery=GPIO%u", BATTERY_ADC_PIN);
+#endif
+  Serial.printf(" samples=%u\n", ADC_SAMPLES);
   if (!initEspNow(ESPNOW_CHANNEL)) Serial.println("[sensor] ESP-NOW initialization failed");
   else {
     esp_now_register_send_cb(onSampleSend);
