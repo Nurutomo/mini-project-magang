@@ -1,0 +1,122 @@
+name: Build Firmware and Deploy Dashboard
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build-firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: [sensor-node, relay-node, gateway]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist-firmware/${{ matrix.env }}"
+          cp ".pio/build/${{ matrix.env }}/bootloader.bin" "dist-firmware/${{ matrix.env }}/"
+          cp ".pio/build/${{ matrix.env }}/partitions.bin" "dist-firmware/${{ matrix.env }}/"
+          cp ".pio/build/${{ matrix.env }}/firmware.bin" "dist-firmware/${{ matrix.env }}/"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: dist-firmware/${{ matrix.env }}
+          retention-days: 7
+
+  deploy-pages:
+    runs-on: ubuntu-latest
+    needs: [build-firmware]
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download node firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-sensor-node
+          path: dist/firmware/sensor-node
+
+      - name: Download relay firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-relay-node
+          path: dist/firmware/relay-node
+
+      - name: Download gateway firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-gateway
+          path: dist/firmware/gateway
+
+      - name: Prepare dashboard and manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp web/index.html dist/index.html
+          printf '{"commit":"%s","builtAt":"%s"}\n' "${GITHUB_SHA::7}" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > dist/commit.json
+          for role in sensor-node relay-node gateway; do
+            case "$role" in
+              sensor-node) name="Solar Sensor and Relay Node ESP32-C3" ;;
+              relay-node) name="Solar Mesh Relay Node ESP32-C3" ;;
+              gateway) name="Solar Node Gateway ESP32-C3" ;;
+            esac
+            cat > "dist/firmware/$role/manifest.json" <<EOF
+          {
+            "name": "$name",
+            "version": "0.1.0",
+            "new_install_prompt_erase": true,
+            "builds": [{
+              "chipFamily": "ESP32-C3",
+              "parts": [
+                { "path": "bootloader.bin", "offset": 0 },
+                { "path": "partitions.bin", "offset": 32768 },
+                { "path": "firmware.bin", "offset": 65536 }
+              ]
+            }]
+          }
+          EOF
+          done
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

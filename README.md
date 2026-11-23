@@ -1,0 +1,151 @@
+# Prototipe Monitoring Lingkungan Berbasis Node Sensor Surya
+
+Implementasi **baru dari nol** untuk prototipe proposal yang diperluas sesuai diagram arsitektur: panel surya 6 V/1 W, BH1750, NTC baterai, input anemometer analog, beberapa ESP32-C3 SuperMini dengan ESP-NOW relay, dan gateway MQTT. Keputusan penggunaan panel/charger/regulator serta sensor angin harus tetap diverifikasi terhadap komponen aktual dan pembimbing.
+
+## Konteks proposal
+
+- **Node sensor:** ESP32-C3 SuperMini, sensor cahaya digital BH1750, NTC 10 kΩ untuk suhu baterai, input ADC dari anemometer dinamo melalui rangkaian proteksi, dan pemantauan tegangan baterai opsional.
+- **Catu daya yang diusulkan:** panel surya 6 V/1 W, dioda Schottky 1N5819, TP4056, baterai 18650 3,7 V, dan regulator HT7333 3,3 V. Susunan dan kompatibilitasnya perlu diverifikasi sebelum dirakit.
+- **Jaringan lokal:** topologi broadcast ESP-NOW dengan image firmware sensor/relay dan relay aplikasi terbatas oleh deduplikasi serta TTL/hop (`pio run -e sensor-node` mengukur sekaligus me-relay; `pio run -e relay-node` hanya me-relay).
+- **Gateway:** ESP32 menerima paket dan menerbitkan payload JSON ke broker MQTT melalui Wi-Fi.
+- **Web:** dashboard statis menerima pesan melalui MQTT over WebSocket dan menampilkan lux, suhu baterai, tegangan baterai, tegangan input anemometer, serta daftar node.
+
+Folder ini adalah **prototipe evaluatif**, bukan sistem operasional atau instalasi kampus. Kebutuhan proyek, komponen, rentang pengukuran, lokasi uji, frekuensi sampling, broker, dan kriteria penerimaan perlu disepakati dengan Direktorat UNESA Smart and Sustainability Campus (USSC). Tidak ada asumsi bahwa mitra telah menyetujui proyek atau menyediakan jaringan/fasilitas.
+
+## Struktur
+
+```text
+mikrokontroler/
+├── platformio.ini
+├── partitions.csv
+├── include/
+│   ├── config.h
+│   ├── config.local.example.h
+│   └── telemetry.h
+├── src/main.cpp
+├── web/index.html
+└── .github/workflows/pages.yml
+```
+
+## Firmware
+
+Dibutuhkan PlatformIO Core. Pilih environment sesuai fungsi board yang diprogram:
+
+```sh
+pio run -e sensor-node  # sensor + relay; gunakan untuk node #1
+pio run -e relay-node   # relay tanpa sensor; gunakan untuk node perantara
+pio run -e gateway      # gateway Wi-Fi / MQTT
+pio device monitor -b 115200
+```
+
+Default `pio run` membangun `sensor-node`. Semua node yang berkomunikasi melalui ESP-NOW harus menggunakan kanal yang sama dengan gateway.
+
+1. Salin `include/config.local.example.h` menjadi `include/config.local.h`.
+2. Untuk Wi-Fi biasa, isi `WIFI_SSID` dan `WIFI_PASSWORD`. Jika SSID tepat `eduroam`, firmware gateway otomatis memakai WPA2-Enterprise PEAP dan mengambil `EDUROAM_USERNAME`, `EDUROAM_IDENTITY`, serta `EDUROAM_PASSWORD`; isikan kredensial institusi milikmu. Identitas sering berupa username yang sama, atau format yang ditentukan kampus. Jangan gunakan password akun kampus di tempat selain file lokal yang diabaikan Git; jangan unggah firmware dengan kredensial personal ke publik.
+3. Jika eduroam kampus mensyaratkan verifikasi sertifikat server, minta CA PEM yang benar dari dukungan TI kampus dan isi `EDUROAM_CA_CERT`. Firmware tidak mencetak password ke serial. Mode PEAP dipilih sebagai konfigurasi umum; metode/identitas eduroam dapat berbeda menurut institusi, jadi cocokkan petunjuk IT kampus.
+4. Untuk gateway, isi `MQTT_HOST`, port broker, dan kredensial bila broker mewajibkannya.
+5. Set `ESPNOW_CHANNEL` sama dengan kanal access point gateway. Kanal AP harus diverifikasi di lokasi; jangan menganggap semua router tetap di kanal 1.
+6. Build dan flash gateway terlebih dahulu, lalu build/flash node.
+7. Buka serial monitor untuk melihat status Wi-Fi, kanal gateway, MQTT, sampel, serta statistik paket. Setiap node/relay harus menggunakan kanal gateway yang tercetak.
+
+`config.local.h` diabaikan Git agar kredensial tidak ikut terunggah. Broker gateway saat ini menggunakan MQTT TCP biasa melalui port 1883 (bila konfigurasi broker mengizinkan); gunakan jaringan tepercaya untuk uji dan jangan memakai kredensial penting. Gateway MQTT TLS belum diimplementasikan.
+
+### Catatan eduroam
+
+- Firmware memilih mode enterprise hanya jika `WIFI_SSID` **persis** `eduroam`. SSID lain tetap memakai WPA2-PSK.
+- ESP32-C3 hanya mendukung Wi-Fi 2,4 GHz. Pastikan lokasi uji menyediakan eduroam 2,4 GHz.
+- Konfigurasi bawaan memakai PEAP/MSCHAPv2. Institusi yang hanya mengizinkan EAP-TLS (sertifikat klien), WPA3-Enterprise, atau onboarding lewat portal belum didukung oleh kode ini.
+- Tanpa `EDUROAM_CA_CERT`, verifikasi sertifikat server tidak dikonfigurasi secara eksplisit dan sebagian jaringan dapat menolak atau tidak memberi jaminan identitas server. Isi CA resmi dari IT kampus bila diwajibkan. Jangan menganggap koneksi sudah aman hanya karena berhasil terhubung.
+- Banyak jaringan kampus membatasi port masuk/keluar atau menerapkan isolasi klien. Pastikan broker MQTT yang dituju memang dapat dijangkau dari jaringan eduroam; broker lokal di laptop/PC lain sering tidak bisa diakses.
+- Gateway mengikuti kanal AP tempat ia terasosiasi. Saat gateway berpindah AP eduroam, kanal dapat berubah dan node ESP-NOW yang memakai `ESPNOW_CHANNEL` tetap tidak akan ikut pindah. Pastikan gateway tetap pada AP/kanal yang sama, atau gunakan AP khusus untuk tautan ESP-NOW. Perubahan kanal hanya dicatat di log, tidak diperbaiki otomatis.
+- Kredensial eduroam bersifat personal; konfigurasi ini bukan pengganti kebijakan keamanan atau pendaftaran perangkat yang ditetapkan pihak kampus.
+
+## Sambungan sensor (rancangan awal, cocokkan dengan board dan modul aktual)
+
+Pin default ESP32-C3 SuperMini: GPIO8 SDA / GPIO9 SCL untuk I2C; GPIO0 NTC; GPIO1 anemometer analog; GPIO3 pemantauan baterai opsional. Pastikan pin tersebut tidak dipakai fungsi board lain. BH1750 umumnya memakai alamat 0x23 (ADDR ke GND) atau 0x5C (ADDR ke VCC).
+
+### BH1750
+
+Firmware membaca BH1750 melalui I2C pada mode continuous high-resolution dan menghitung lux sebagai raw / 1.2. Ini implementasi dasar mengikuti skala sensor, bukan kalibrasi sistem. Catat kondisi pemasangan, orientasi, rentang, dan bandingkan dengan alat rujukan bila tersedia.
+
+### Anemometer dinamo kecil
+
+Input analog GPIO1 hanya merekam tegangan yang sudah melalui rangkaian divider/proteksi. Firmware **belum menghitung kecepatan angin** karena hubungan putaran/tegangan terhadap m/s memerlukan karakterisasi dan kalibrasi anemometer aktual. Diagram menyebut zener 3.3 V; pilih zener dan resistor seri sesuai arus, impedansi sumber, batas ADC, polaritas/transien, serta disipasi. Jangan menghubungkan dinamo langsung ke pin ESP32. Pastikan tegangan pada ADC selalu dalam rentang aman.
+
+### NTC 10 kΩ
+
+Asumsi pembagi: 3V3 → resistor tetap 10 kΩ → titik ADC → NTC 10 kΩ → GND. Firmware memakai beta 3950 K dan nominal 25 °C; keduanya harus diganti bila datasheet NTC berbeda. Gunakan resistor pull-up/pembagi yang sesuai dan pemasangan termal yang aman. NTC ini hanya untuk pemantauan, bukan pengganti sensor/proteksi charger atau BMS.
+
+### Tegangan baterai (opsional)
+
+GPIO3 membaca melalui pembagi resistif dengan faktor default 2.0. Pastikan rasio aktual, toleransi resistor, batas ADC, dan tegangan maksimum sesuai. Jika tidak memasang divider, set `FEATURE_BATTERY_SENSE 0`. Jangan hubungkan baterai langsung ke pin ADC.
+
+**Keselamatan:** Jangan merakit/mengukur PHB atau sumber tegangan berbahaya dengan prototipe ini. Gunakan sel 18650 terlindungi, charger Li-ion sesuai kimia dan konfigurasi sel, proteksi arus lebih/overcharge/overdischarge, pembatasan arus, isolasi, penahan sel, dan pengawasan yang sesuai. Verifikasi rancangan catu oleh pembimbing sebelum menghubungkan panel atau baterai. Jangan tinggalkan pengisian tanpa pengawasan.
+
+## Sistem daya surya dan peringatan rancangan
+
+Diagram yang diberikan mengusulkan **panel 6 V/1 W → 1N5819 → TP4056 → sel 18650 → HT7333 3.3 V → ESP32-C3**. Firmware tidak mengendalikan charger/regulator tersebut dan diagram ini masih perlu tinjauan pembimbing sebelum dirakit. TP4056 standar umumnya dirancang untuk input sumber tegangan yang relatif stabil sekitar 5 V, bukan panel surya 6 V dengan karakteristik berubah-ubah. Dioda seri mengurangi tegangan tetapi tidak mengatur/menstabilkan daya; panel 6 V langsung melalui dioda dapat tetap berada di atas batas input saat irradiance tinggi. Gunakan charger solar yang sesuai (dengan pembatasan tegangan/arus dan power-path yang tepat), cocokkan dengan spesifikasi sel, serta verifikasi rangkaian oleh pembimbing. Jangan menganggap kombinasi panel–dioda–TP4056 aman atau optimal hanya dari diagram.
+
+HT7333 adalah LDO 3.3 V; headroom, drop-out, arus puncak radio ESP32-C3, arus diam, arus output, dan disipasi perlu diverifikasi. Kapasitas 1 W panel juga belum membuktikan energi cukup; ukur profil beban dan hasil pengisian dalam kondisi nyata. Gunakan sel 18650 terlindungi dan jangan meninggalkan pengisian tanpa pengawasan.
+
+## Alur data / topologi
+
+```text
+BH1750 + NTC + dinamo anemometer (ADC terlindungi)
+                  │
+                  ▼
+  Node sensor ESP32-C3 + ESP-NOW relay broadcast
+         ↕ node/relay perantara (ESP32-C3)
+                  │
+                  ▼
+    ESP32 gateway ── Wi-Fi/IP ── MQTT broker
+                                      │ MQTT over WebSocket
+                                      ▼
+                              web/index.html
+```
+
+Image `sensor-node` juga mengaktifkan penerusan paket untuk mendukung node #1 yang sekaligus mengukur. Image `relay-node` hanya meneruskan paket; image `gateway` menerima dan menerbitkan MQTT. Relay dilakukan dengan rebroadcast, jitter, pengurangan TTL, penambahan hop, dan cache ID+sequence untuk menekan duplikasi/broadcast storm. Ini **protokol relay demonstrasi sederhana, bukan mesh routing yang resilien**; uji topologi, kehilangan paket, interferensi, dan jangkauan diperlukan.
+
+Paket radio berversi membawa ID node, nomor urut, uptime, hop, TTL, flags validitas, lux (centilux), suhu (centi-°C), dan tegangan (mV). Gateway melakukan validasi ukuran/header dan deduplikasi sederhana, lalu menerbitkan:
+
+- `<prefix>/<node_id>/state` — JSON telemetri
+- `<prefix>/gateway/status` — retained `online`/`offline`
+
+Prefix default `unesa/ussc/sensor`. Contoh JSON:
+
+```json
+{"schema":1,"node_id":"node-a1b2c3","sequence":3,"lux_lx":245.5,"battery_temp_c":31.2,"battery_v":3.91,"hop":0,"rssi_dbm":-52,"gateway_rx_epoch":1795171200}
+```
+
+**Relay/multi-hop dasar sudah diprogram**, tetapi ini bukan mesh routing otomatis atau protokol yang teruji ketahanan. Firmware menambahkan deduplikasi, jitter acak, hop, dan TTL. Pengiriman broadcast tetap best-effort; topologi, jumlah node, kehilangan paket, duplikasi, interferensi, dan jangkauan harus diuji sebelum menarik kesimpulan.
+
+ESP-NOW broadcast ini tidak dienkripsi. Jangan mengirim data sensitif; penambahan peer terenkripsi dan manajemen kunci dibutuhkan sebelum penggunaan lebih luas. Gateway yang terhubung ke AP menggunakan kanal Wi-Fi AP, jadi semua node dan relay harus diprogram dengan kanal tersebut (lihat log gateway), bukan mengandalkan `ESPNOW_CHANNEL` jika nilainya berbeda. Dashboard web memerlukan broker yang menyediakan MQTT over WebSocket (`ws://` atau, disarankan, `wss://`) dan mengizinkan koneksi browser. Kredensial broker di halaman statis tidak rahasia.
+
+## Web dashboard lokal
+
+Untuk mencoba tampilan statis, jalankan server dari folder proyek:
+
+```sh
+python3 -m http.server 8000 --directory web
+```
+
+Buka `http://localhost:8000`. Isi URL WebSocket broker dan prefix topik, lalu hubungkan. Preferensinya disimpan lokal pada browser. Web dashboard tidak menyediakan backend, autentikasi, penyimpanan historis, atau broker; semua itu memerlukan infrastruktur terpisah. MQTT.js dimuat dari jsDelivr versi tetap.
+
+## Publikasi GitHub Pages
+
+Workflow `.github/workflows/pages.yml` membangun firmware sensor/relay dan gateway, membuat paket unduhan firmware dan manifest, lalu menerbitkan dashboard statis melalui GitHub Pages. Setelah proyek berada di repositori GitHub, aktifkan Pages dengan sumber **GitHub Actions**. Situs statis tetap perlu broker MQTT WebSocket yang dapat dijangkau browser.
+
+## Batasan dan rencana uji
+
+- Dukungan pembacaan yang diprogram: BH1750 I2C, NTC, tegangan ADC anemometer, dan divider tegangan baterai. Nilai tegangan anemometer belum menjadi kecepatan angin.
+- NTC diasumsikan beta 3950 K; cocokkan dengan datasheet aktual.
+- Tegangan dinamo anemometer wajib dikondisikan/proteksi dan dibatasi sebelum pin ADC; uji tegangan maksimum dan transien secara aman.
+- Baterai dan charger solar memerlukan tinjauan listrik/termal terpisah; jangan gunakan susunan TP4056 pada panel 6 V tanpa memastikan batas input dan kebutuhan charger solar.
+- Estimasi ketahanan baterai belum dapat dinyatakan sebelum arus sistem, siklus sampling, panel, kapasitas sel, dan kondisi pencahayaan diuji.
+- Deep sleep dimatikan secara default; relay perlu tetap aktif mendengarkan. Mengaktifkan sleep pada image sensor mematikan relay dan perlu konfigurasi peran terpisah sebelum uji hemat energi.
+- Gateway queue bersifat RAM/best-effort; pesan dapat hilang jika broker putus atau queue penuh. Mekanisme ini belum memiliki store-and-forward.
+- Relay sederhana tidak menjamin pengiriman, routing optimal, atau pemulihan rute; TTL dan deduplikasi hanya batas dasar.
+- Target kinerja numerik ditetapkan setelah komponen, lingkungan, jumlah node, dan metode uji disepakati.
+- Belum ada klaim uji perangkat keras atau penerapan lapangan.
+
+Rencana uji: pembacaan BH1750 dibanding alat rujukan, karakterisasi ADC anemometer dan kalibrasi tegangan-ke-kecepatan, verifikasi pembagi NTC, uji node langsung dan relay dengan hitung paket hilang/duplikat serta latensi, keberhasilan publish MQTT, pengukuran arus dan energi catu, tinjauan keselamatan, dokumentasi, dan validasi pembimbing/mitra.
