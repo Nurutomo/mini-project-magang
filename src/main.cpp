@@ -246,8 +246,10 @@ String deviceId() {
   uint8_t mac[6] = {};
   // Reads the eFuse MAC; unlike WiFi.macAddress() this works before WiFi.mode().
   if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return String("node-unknown");
-  char id[16];
-  snprintf(id, sizeof(id), "node-%02X%02X%02X", mac[3], mac[4], mac[5]);
+  // Use all 48 eFuse MAC bits; the previous 24-bit suffix could collide.
+  char id[20];
+  snprintf(id, sizeof(id), "node-%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(id);
 }
 
@@ -739,6 +741,7 @@ TelemetryPacket collectTelemetry() {
   TelemetryPacket packet = makeEmptyTelemetry();
   const String id = deviceId();
   strlcpy(packet.nodeId, id.c_str(), sizeof(packet.nodeId));
+  strlcpy(packet.from, id.c_str(), sizeof(packet.from));
   packet.sequence = ++sequenceNumber;
   packet.uptimeMs = millis();
   packet.hop = 0;
@@ -806,6 +809,7 @@ bool initEspNow(uint8_t channel) {
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
 void onRelayReceive(const esp_now_recv_info_t *, const uint8_t *data, int len);
+void onRelayBeacon(const uint8_t *data);
 #endif
 
 void onNodeReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -816,10 +820,13 @@ void onNodeReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len
     hasPendingSyncBeacon = true;
     portEXIT_CRITICAL(&syncBeaconMux);
     blinkStatusLed(1);
+#if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
+    onRelayBeacon(data);
+#endif
     return;
   }
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
-  if (isValidTelemetryPacket(data, static_cast<size_t>(len))) onRelayReceive(nullptr, data, len);
+  if (isValidTelemetryPacket(data, static_cast<size_t>(len))) onRelayReceive(info, data, len);
 #endif
 }
 
@@ -1135,6 +1142,69 @@ struct SeenPacket { char nodeId[NODE_ID_MAX_LEN]; uint32_t sequence; };
 SeenPacket relaySeen[RELAY_DEDUP_SIZE]{};
 uint16_t relaySeenCursor = 0;
 
+struct RelayBeaconItem { SyncBeacon beacon; };
+RelayBeaconItem relayBeaconQueue[RELAY_DEDUP_SIZE];
+volatile uint8_t relayBeaconHead = 0, relayBeaconTail = 0;
+portMUX_TYPE relayBeaconMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t relayBeaconDropped = 0;
+
+bool wasBeaconRelayed(const SyncBeacon &beacon) {
+  static SeenPacket beaconSeen[RELAY_DEDUP_SIZE]{};
+  static uint16_t beaconSeenCursor = 0;
+  for (const auto &seen : beaconSeen) {
+    if (seen.nodeId[0] && strncmp(seen.nodeId, beacon.fromId, NODE_ID_MAX_LEN) == 0 &&
+        seen.sequence == beacon.sequence) return true;
+  }
+  auto &slot = beaconSeen[beaconSeenCursor++ % RELAY_DEDUP_SIZE];
+  strlcpy(slot.nodeId, beacon.fromId, sizeof(slot.nodeId));
+  slot.sequence = beacon.sequence;
+  return false;
+}
+
+void onRelayBeacon(const uint8_t *data) {
+  const auto *beacon = reinterpret_cast<const SyncBeacon *>(data);
+  if (beacon->ttl == 0 || (beacon->flags & FLAG_BEACON_RELAYED) != 0) return;
+  RelayBeaconItem item{};
+  item.beacon = *beacon;
+  portENTER_CRITICAL(&relayBeaconMux);
+  const uint8_t next = static_cast<uint8_t>((relayBeaconHead + 1) % RELAY_DEDUP_SIZE);
+  if (next == relayBeaconTail) {
+    ++relayBeaconDropped;
+    portEXIT_CRITICAL(&relayBeaconMux);
+    return;
+  }
+  relayBeaconQueue[relayBeaconHead] = item;
+  relayBeaconHead = next;
+  portEXIT_CRITICAL(&relayBeaconMux);
+}
+
+void relayQueuedBeacons() {
+  while (true) {
+    RelayBeaconItem item{};
+    bool found = false;
+    portENTER_CRITICAL(&relayBeaconMux);
+    if (relayBeaconTail != relayBeaconHead) {
+      item = relayBeaconQueue[relayBeaconTail];
+      relayBeaconTail = static_cast<uint8_t>((relayBeaconTail + 1) % RELAY_DEDUP_SIZE);
+      found = true;
+    }
+    portEXIT_CRITICAL(&relayBeaconMux);
+    if (!found) break;
+    auto &beacon = item.beacon;
+    if (strncmp(beacon.fromId, deviceId().c_str(), NODE_ID_MAX_LEN) == 0 ||
+        wasBeaconRelayed(beacon)) continue;
+    delay(random(0, RELAY_JITTER_MS));
+    blinkStatusLed(1);
+    --beacon.ttl;
+    beacon.flags |= FLAG_BEACON_RELAYED;
+    const esp_err_t result = esp_now_send(BROADCAST_MAC,
+                                           reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
+    Serial.printf("[relay] %s beacon from=%s seq=%lu ttl=%u\n",
+                  result == ESP_OK ? "forwarded" : "send error", beacon.fromId,
+                  static_cast<unsigned long>(beacon.sequence), beacon.ttl);
+  }
+}
+
 bool wasRelayed(const TelemetryPacket &packet) {
   for (const auto &seen : relaySeen) {
     if (seen.nodeId[0] && strncmp(seen.nodeId, packet.nodeId, NODE_ID_MAX_LEN) == 0 &&
@@ -1146,11 +1216,19 @@ bool wasRelayed(const TelemetryPacket &packet) {
   return false;
 }
 
-void onRelayReceive(const esp_now_recv_info_t *, const uint8_t *data, int len) {
+void onRelayReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (isValidSyncBeacon(data, static_cast<size_t>(len))) {
+    onRelayBeacon(data);
+    return;
+  }
   if (!isValidTelemetryPacket(data, static_cast<size_t>(len))) return;
   blinkStatusLed(1);
   RelayItem item{};
   memcpy(&item.packet, data, sizeof(TelemetryPacket));
+  if (info && info->src_addr) {
+    const String relayId = deviceId();
+    strlcpy(item.packet.from, relayId.c_str(), sizeof(item.packet.from));
+  }
   portENTER_CRITICAL(&relayMux);
   const uint8_t next = static_cast<uint8_t>((relayHead + 1) % GATEWAY_QUEUE_SIZE);
   if (next == relayTail) {
@@ -1183,6 +1261,8 @@ void relayQueuedPackets() {
     --packet.ttl;
     ++packet.hop;
     packet.flags |= FLAG_RELAYED;
+    const String relayId = deviceId();
+    strlcpy(packet.from, relayId.c_str(), sizeof(packet.from));
     const esp_err_t result = esp_now_send(BROADCAST_MAC,
                                            reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
     Serial.printf("[relay] %s node=%s seq=%lu hop=%u ttl=%u\n",
@@ -1340,6 +1420,9 @@ bool sendSyncBeacon(bool windowOpen) {
   const int32_t windowRemaining = static_cast<int32_t>(gatewayWindowOpenedAt + runtimeActiveWindowMs - now);
   beacon.window_remaining_ms = windowOpen && windowRemaining > 0
       ? static_cast<uint32_t>(windowRemaining) : 0;
+  const String gatewayId = deviceId();
+  strlcpy(beacon.fromId, gatewayId.c_str(), sizeof(beacon.fromId));
+  beacon.ttl = ESPNOW_TTL;
   const esp_err_t result = esp_now_send(BROADCAST_MAC,
       reinterpret_cast<const uint8_t *>(&beacon), sizeof(beacon));
   if (result == ESP_OK) blinkStatusLed(1);
@@ -1382,8 +1465,12 @@ void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac, int8
   gatewayLastLuxValid = (packet.flags & FLAG_LUX_VALID) != 0;
   gatewayLastLux = gatewayLastLuxValid ? packet.luxCenti / 100.0f : NAN;
   JsonDocument doc;
-  doc["schema"] = 2;
+  doc["schema"] = 3;
   doc["node_id"] = packet.nodeId;
+  doc["from"] = packet.from;
+  doc["sensor_interval_ms"] = runtimeSensorIntervalMs;
+  doc["beacon_interval_ms"] = runtimeBeaconIntervalMs;
+  doc["active_window_ms"] = runtimeActiveWindowMs;
   doc["sequence"] = packet.sequence;
   doc["uptime_ms"] = packet.uptimeMs;
   doc["hop"] = packet.hop;
@@ -1398,7 +1485,7 @@ void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac, int8
   if (packet.flags & FLAG_NTC_VALID) doc["battery_temp_c"] = packet.batteryTempCentiC / 100.0f;
   if (packet.flags & FLAG_BATTERY_VALID) doc["battery_v"] = packet.batteryMilliVolts / 1000.0f;
   if (packet.flags & FLAG_WIND_VALID) doc["wind_input_v"] = packet.windMilliVolts / 1000.0f;
-  char payload[320];
+  char payload[384];
   const size_t len = serializeJson(doc, payload, sizeof(payload));
   const String topic = mqttTopicPrefix + "/" + packet.nodeId + "/state";
   if (mqttClient.connected()) {
@@ -1614,9 +1701,13 @@ void loop() {
 #endif
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
-  if (nodeWindowOpen) relayQueuedPackets();
+  if (nodeWindowOpen) {
+    relayQueuedPackets();
+    relayQueuedBeacons();
+  }
 #else
   relayQueuedPackets();
+  relayQueuedBeacons();
 #endif
 #endif
 #if (defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR) || (defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY)

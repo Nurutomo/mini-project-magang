@@ -5,9 +5,9 @@
 
 // Versioned application packet shared by sensor/relay nodes and gateway.
 static constexpr uint8_t TELEMETRY_MAGIC = 0xA7;
-static constexpr uint8_t TELEMETRY_VERSION = 2;
+static constexpr uint8_t TELEMETRY_VERSION = 3;
 static constexpr size_t NODE_ID_MAX_LEN = 20;
-static constexpr size_t TELEMETRY_WIRE_SIZE = 46;
+static constexpr size_t TELEMETRY_WIRE_SIZE = 63;
 
 struct __attribute__((packed)) TelemetryPacket {
   uint8_t magic;
@@ -22,7 +22,7 @@ struct __attribute__((packed)) TelemetryPacket {
   int16_t batteryTempCentiC;
   uint16_t batteryMilliVolts;
   uint16_t windMilliVolts;
-  uint8_t reserved[3];
+  char from[NODE_ID_MAX_LEN];
 };
 
 static_assert(sizeof(TelemetryPacket) == TELEMETRY_WIRE_SIZE,
@@ -36,8 +36,12 @@ static constexpr uint8_t FLAG_RELAYED = 1 << 4;
 
 // Repeated gateway broadcast. remaining_sleep_ms is the time to the next
 // synchronized sensor window, measured when the beacon is assembled.
+// fromId is the originating gateway; relays preserve it, so a node that hears
+// only a relayed beacon still knows the schedule came from the gateway.
 static constexpr uint8_t SYNC_BEACON_MAGIC = 0xB8;
-static constexpr uint8_t SYNC_BEACON_VERSION = 2;
+static constexpr uint8_t SYNC_BEACON_VERSION = 3;
+static constexpr size_t SYNC_BEACON_WIRE_SIZE = 55;
+static constexpr uint8_t FLAG_BEACON_RELAYED = 1 << 0;
 struct __attribute__((packed)) SyncBeacon {
   uint8_t magic;
   uint8_t version;
@@ -51,13 +55,21 @@ struct __attribute__((packed)) SyncBeacon {
   uint32_t beacon_interval_ms;
   uint32_t active_window_ms;
   uint32_t window_remaining_ms;
+  char fromId[NODE_ID_MAX_LEN];
+  uint8_t ttl;
+  uint8_t flags;
 };
 
+static_assert(sizeof(SyncBeacon) == SYNC_BEACON_WIRE_SIZE,
+              "Unexpected sync beacon layout");
+
 inline bool isValidSyncBeacon(const uint8_t *data, size_t len) {
-  if (!data || len != sizeof(SyncBeacon)) return false;
+  if (!data || len != SYNC_BEACON_WIRE_SIZE) return false;
   const auto *beacon = reinterpret_cast<const SyncBeacon *>(data);
   return beacon->magic == SYNC_BEACON_MAGIC &&
          beacon->version == SYNC_BEACON_VERSION &&
+         beacon->fromId[NODE_ID_MAX_LEN - 1] == '\0' && beacon->fromId[0] != '\0' &&
+         beacon->ttl <= 8 &&
          beacon->channel >= 1 && beacon->channel <= 13 &&
          beacon->next_channel >= 1 && beacon->next_channel <= 13 &&
          beacon->channel_switch_delay_ms <= 60000 &&
@@ -78,7 +90,8 @@ inline bool isValidTelemetryPacket(const uint8_t *data, size_t len) {
   if (data == nullptr || len != sizeof(TelemetryPacket)) return false;
   const auto *packet = reinterpret_cast<const TelemetryPacket *>(data);
   if (packet->magic != TELEMETRY_MAGIC || packet->version != TELEMETRY_VERSION) return false;
-  if (packet->nodeId[NODE_ID_MAX_LEN - 1] != '\0' || packet->nodeId[0] == '\0') return false;
+  if (packet->nodeId[NODE_ID_MAX_LEN - 1] != '\0' || packet->nodeId[0] == '\0' ||
+      packet->from[NODE_ID_MAX_LEN - 1] != '\0' || packet->from[0] == '\0') return false;
   return packet->ttl <= 8 && packet->hop <= 8;
 }
 

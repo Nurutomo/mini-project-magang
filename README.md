@@ -109,7 +109,7 @@ BH1750 + NTC + dinamo anemometer (ADC terlindungi)
 
 Image `sensor-relay` mengukur sekaligus meneruskan paket untuk mendukung node sensor dan relay perantara; image `gateway` menerima paket dan menerbitkan MQTT. Relay dilakukan dengan rebroadcast, jitter, pengurangan TTL, penambahan hop, dan cache ID+sequence untuk menekan duplikasi/broadcast storm. Ini **protokol relay demonstrasi sederhana, bukan mesh routing yang resilien**; uji topologi, kehilangan paket, interferensi, dan jangkauan diperlukan.
 
-Paket radio berversi membawa ID node, nomor urut, uptime, hop, TTL, flags validitas, lux (centilux), suhu (centi-°C), dan tegangan (mV). Gateway melakukan validasi ukuran/header dan deduplikasi sederhana, lalu menerbitkan:
+Paket radio telemetri berversi membawa ID node sumber, pemancar langsung terakhir (`from`), nomor urut, uptime, hop, TTL, flags validitas, lux (centilux), suhu (centi-°C), dan tegangan (mV). Beacon sinkronisasi membawa channel, sensor interval, beacon interval, active window, dan ID gateway asal (`fromId`); relay mengadopsi lalu meneruskan beacon pertama per sequence dengan TTL terbatas, sehingga node yang hanya mendengar relay tetap tahu jadwal berasal dari gateway. Gateway melakukan validasi ukuran/header dan deduplikasi sederhana, lalu menerbitkan:
 
 - `<prefix>/<node_id>/state` — JSON telemetri
 - `<prefix>/gateway/status` — retained `online`/`offline`
@@ -117,7 +117,7 @@ Paket radio berversi membawa ID node, nomor urut, uptime, hop, TTL, flags validi
 Prefix default `unesa/ussc/sensor`. Contoh JSON:
 
 ```json
-{"schema":1,"node_id":"node-a1b2c3","sequence":3,"lux_lx":245.5,"battery_temp_c":31.2,"battery_v":3.91,"hop":0,"rssi_dbm":-52,"gateway_rx_epoch":1795171200}
+{"schema":3,"node_id":"node-7C9EBD123456","from":"node-AABBCCDDEEFF","sensor_interval_ms":300000,"beacon_interval_ms":1000,"active_window_ms":3000,"sequence":3,"uptime_ms":125430,"hop":1,"relayed":true,"rssi_dbm":-52,"gateway_rx_epoch":1795171200,"source_mac":"7C:9E:BD:65:43:21","lux_lx":245.5,"battery_temp_c":31.2,"battery_v":3.91}
 ```
 
 **Relay/multi-hop dasar sudah diprogram**, tetapi ini bukan mesh routing otomatis atau protokol yang teruji ketahanan. Firmware menambahkan deduplikasi, jitter acak, hop, dan TTL. Pengiriman broadcast tetap best-effort; topologi, jumlah node, kehilangan paket, duplikasi, interferensi, dan jangkauan harus diuji sebelum menarik kesimpulan.
