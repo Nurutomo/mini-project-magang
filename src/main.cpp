@@ -75,6 +75,8 @@ bool publishSample();
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
 bool sendSyncBeacon(bool windowOpen);
 void onGatewayReceive(const esp_now_recv_info_t *, const uint8_t *, int);
+bool initEspNow(uint8_t channel);
+void configureMaxTxPower();
 extern uint8_t gatewayRadioChannel;
 #endif
 
@@ -159,14 +161,14 @@ void loadMeshConfig() {
     meshPreferences.end();
   }
   if (runtimeMeshChannel < 1 || runtimeMeshChannel > 13) runtimeMeshChannel = ESPNOW_CHANNEL;
-  if (runtimeSensorIntervalMs < 10000 || runtimeSensorIntervalMs > 86400000UL)
+  if (runtimeSensorIntervalMs < 500 || runtimeSensorIntervalMs > 86400000UL)
     runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
-  if (runtimeActiveWindowMs < 500 || runtimeActiveWindowMs > 10000)
+  if (runtimeActiveWindowMs < 100 || runtimeActiveWindowMs > 86400000UL)
     runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
   if (runtimeSensorIntervalMs <= runtimeActiveWindowMs)
-    runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL > runtimeActiveWindowMs
-        ? SAMPLE_INTERVAL_S * 1000UL : runtimeActiveWindowMs + 10000UL;
-  if (runtimeBeaconIntervalMs < 100 || runtimeBeaconIntervalMs > 60000 ||
+    runtimeActiveWindowMs = runtimeSensorIntervalMs > 200
+        ? runtimeSensorIntervalMs - 1 : 200;
+  if (runtimeBeaconIntervalMs < 100 || runtimeBeaconIntervalMs > 30000 ||
       runtimeBeaconIntervalMs > runtimeActiveWindowMs / 2) {
     runtimeBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
     if (runtimeBeaconIntervalMs > runtimeActiveWindowMs / 2)
@@ -335,10 +337,46 @@ void handleMeshCommand(String command) {
   if (command == "mesh show") {
     const uint8_t displayedChannel = WiFi.status() == WL_CONNECTED
         ? static_cast<uint8_t>(WiFi.channel()) : runtimeMeshChannel;
-    Serial.printf("[mesh] channel=%u sensor_interval_s=%lu beacon_interval_ms=%lu active_window_ms=%lu\n",
-                  displayedChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL),
+    Serial.printf("[mesh] channel=%u sensor_interval_ms=%lu beacon_interval_ms=%lu active_window_ms=%lu\n",
+                  displayedChannel, static_cast<unsigned long>(runtimeSensorIntervalMs),
                   static_cast<unsigned long>(runtimeBeaconIntervalMs),
                   static_cast<unsigned long>(runtimeActiveWindowMs));
+    return;
+  }
+  if (command.startsWith("mesh window ")) {
+    String value = command.substring(12); value.trim();
+    char *end = nullptr;
+    const unsigned long windowMs = strtoul(value.c_str(), &end, 10);
+    if (value.isEmpty() || !end || *end || windowMs < 200 || windowMs > 86400000UL) {
+      Serial.println("[mesh] usage: mesh window <active_window_ms 200..86400000>");
+      return;
+    }
+    if (windowMs >= runtimeSensorIntervalMs) {
+      Serial.printf("[mesh] active window must be shorter than the sensor interval (%lu ms)\n",
+                    static_cast<unsigned long>(runtimeSensorIntervalMs));
+      return;
+    }
+    const uint32_t maxBeaconMs = static_cast<uint32_t>(windowMs / 2);
+    const uint32_t newBeaconMs = runtimeBeaconIntervalMs > maxBeaconMs
+        ? (maxBeaconMs < 100 ? 100 : maxBeaconMs) : runtimeBeaconIntervalMs;
+    runtimeActiveWindowMs = static_cast<uint32_t>(windowMs);
+    runtimeBeaconIntervalMs = newBeaconMs;
+    if (!saveMeshConfig()) {
+      runtimeActiveWindowMs = previousActiveWindowMs;
+      runtimeBeaconIntervalMs = previousBeaconIntervalMs;
+      rtcActiveWindowMs = previousActiveWindowMs;
+      rtcBeaconIntervalMs = previousBeaconIntervalMs;
+      Serial.println("[mesh] NVS save failed; previous configuration retained");
+    } else {
+      const uint32_t now = millis();
+      gatewayWindowActive = false;
+      gatewayNextWindowAt = now + runtimeSensorIntervalMs;
+      gatewayNextSensorSlotAt = gatewayNextWindowAt;
+      gatewayNextBeaconAt = now;
+      Serial.printf("[mesh] active window=%lu ms beacon=%lu ms saved in NVS\n",
+                    static_cast<unsigned long>(runtimeActiveWindowMs),
+                    static_cast<unsigned long>(runtimeBeaconIntervalMs));
+    }
     return;
   }
   if (!command.startsWith("mesh set ")) return;
@@ -352,24 +390,19 @@ void handleMeshCommand(String command) {
   char *end = nullptr;
   const long channel = count > 0 ? strtol(values[0].c_str(), &end, 10) : 0;
   bool valid = count == 3 && fields.isEmpty() && end && !*end && channel >= 1 && channel <= 13;
-  const long sensorSec = count > 1 ? strtol(values[1].c_str(), &end, 10) : 0;
-  valid = valid && end && !*end && sensorSec >= 10 && sensorSec <= 86400 &&
-          sensorSec * 1000L > runtimeActiveWindowMs;
+  const long sensorMs = count > 1 ? strtol(values[1].c_str(), &end, 10) : 0;
+  valid = valid && end && !*end && sensorMs >= 500 && sensorMs <= 86400000L &&
+          sensorMs > runtimeActiveWindowMs;
   const long beaconMs = count > 2 ? strtol(values[2].c_str(), &end, 10) : 0;
-  valid = valid && end && !*end && beaconMs >= 100 && beaconMs <= 60000;
+  valid = valid && end && !*end && beaconMs >= 100 && beaconMs <= 30000 &&
+          beaconMs <= runtimeActiveWindowMs / 2;
   if (!valid) {
-    Serial.println("[mesh] usage: mesh set <channel 1..13> <sensor_interval_seconds 10..86400> <beacon_interval_ms 100..1500>");
+    Serial.println("[mesh] usage: mesh set <channel 1..13> <sensor_interval_ms 500..86400000> <beacon_interval_ms 100..30000>; sensor interval must exceed active window and beacon <= half window");
     return;
   }
   if (WiFi.status() == WL_CONNECTED && channel != WiFi.channel()) {
     Serial.printf("[mesh] channel %ld conflicts with Wi-Fi AP channel %ld; AP channel is authoritative\n",
                   channel, static_cast<long>(WiFi.channel()));
-    return;
-  }
-  const uint32_t newActiveWindowMs = runtimeActiveWindowMs;
-  if (beaconMs > static_cast<long>(newActiveWindowMs / 2)) {
-    Serial.printf("[mesh] beacon interval must be <= half the active window (%lu ms)\n",
-                  static_cast<unsigned long>(newActiveWindowMs / 2));
     return;
   }
   if (channel != previousChannel) {
@@ -382,9 +415,8 @@ void handleMeshCommand(String command) {
     gatewayChannelSwitchAt = 0;
   }
   runtimeMeshChannel = static_cast<uint8_t>(channel);
-  runtimeSensorIntervalMs = static_cast<uint32_t>(sensorSec) * 1000UL;
+  runtimeSensorIntervalMs = static_cast<uint32_t>(sensorMs);
   runtimeBeaconIntervalMs = static_cast<uint32_t>(beaconMs);
-  runtimeActiveWindowMs = newActiveWindowMs;
   if (!saveMeshConfig()) {
     gatewayChannelChangePending = false;
     gatewayPendingChannel = previousChannel;
@@ -490,7 +522,7 @@ void handleWifiCommand(String command) {
     Serial.println("[mqtt] settings updated (password hidden); use 'mqtt save' to persist"); return;
   }
   if (command == "wifi" || command == "wifi help") {
-    Serial.println("mesh set <channel> <sensor_interval_seconds> <beacon_interval_ms> | mesh show");
+    Serial.println("mesh set <channel> <sensor_interval_ms 500..86400000> <beacon_interval_ms 100..30000> | mesh window <active_window_ms 200..86400000> | mesh show");
     Serial.println("wifi set <ssid> <password>");
     Serial.println("wifi set eduroam <username> <password> [identity]");
     Serial.println("wifi ca <single-line PEM; replace newlines with \\n> | wifi ca clear");
@@ -997,26 +1029,54 @@ void pollNodeSerial() {
           const long beacon = strtol(beaconText.c_str(), &end, 10);
           const bool beaconValid = end && !*end;
           if (channelValid && intervalValid && beaconValid && channel >= 1 && channel <= 13 &&
-              interval >= 10 && interval <= 86400 && interval * 1000L > runtimeActiveWindowMs &&
-              beacon >= 100 && beacon <= 60000 && beacon <= runtimeActiveWindowMs / 2) {
+              interval >= 500 && interval <= 86400000L && interval > runtimeActiveWindowMs &&
+              beacon >= 100 && beacon <= 30000 && beacon <= runtimeActiveWindowMs / 2) {
             const uint8_t previousNodeChannel = runtimeMeshChannel;
             if (channel != previousNodeChannel) Serial.println("[mesh-info] configured channel; gateway announcement takes precedence when received");
             runtimeMeshChannel = static_cast<uint8_t>(channel);
-            runtimeSensorIntervalMs = static_cast<uint32_t>(interval) * 1000UL;
+            runtimeSensorIntervalMs = static_cast<uint32_t>(interval);
             runtimeBeaconIntervalMs = static_cast<uint32_t>(beacon);
-            runtimeActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
             if (saveMeshConfig()) Serial.println("[mesh] saved; reboot to apply local configuration");
             else {
               runtimeMeshChannel = previousNodeChannel;
               rtcMeshChannel = previousNodeChannel;
               Serial.println("[mesh] failed to save configuration");
             }
-          } else Serial.println("[mesh] values out of range; sensor interval must exceed active window and beacon must be 100..1500 ms");
-        } else Serial.println("[mesh] usage: mesh set <channel> <sensor_interval_seconds> <beacon_interval_ms <= 1500>");
+          } else Serial.println("[mesh] values out of range; sensor interval (ms) must exceed active window and beacon must be <= half window");
+        } else Serial.println("[mesh] usage: mesh set <channel> <sensor_interval_ms 500..86400000> <beacon_interval_ms 100..30000>");
+      } else if (nodeSerialCommand.startsWith("mesh window ")) {
+        String value = nodeSerialCommand.substring(12); value.trim();
+        char *end = nullptr;
+        const unsigned long windowMs = strtoul(value.c_str(), &end, 10);
+        if (value.isEmpty() || !end || *end || windowMs < 200 || windowMs > 86400000UL) {
+          Serial.println("[mesh] usage: mesh window <active_window_ms 200..86400000>");
+        } else if (windowMs >= runtimeSensorIntervalMs) {
+          Serial.printf("[mesh] active window must be shorter than the sensor interval (%lu ms)\n",
+                        static_cast<unsigned long>(runtimeSensorIntervalMs));
+        } else {
+          const uint32_t previousActiveWindowMs = runtimeActiveWindowMs;
+          const uint32_t previousBeaconIntervalMs = runtimeBeaconIntervalMs;
+          const uint32_t maxBeaconMs = static_cast<uint32_t>(windowMs / 2);
+          runtimeActiveWindowMs = static_cast<uint32_t>(windowMs);
+          runtimeBeaconIntervalMs = runtimeBeaconIntervalMs > maxBeaconMs
+              ? (maxBeaconMs < 100 ? 100 : maxBeaconMs) : runtimeBeaconIntervalMs;
+          if (saveMeshConfig()) {
+            Serial.printf("[mesh] active window=%lu ms beacon=%lu ms saved; reboot to apply local configuration\n",
+                          static_cast<unsigned long>(runtimeActiveWindowMs),
+                          static_cast<unsigned long>(runtimeBeaconIntervalMs));
+          } else {
+            runtimeActiveWindowMs = previousActiveWindowMs;
+            runtimeBeaconIntervalMs = previousBeaconIntervalMs;
+            rtcActiveWindowMs = previousActiveWindowMs;
+            rtcBeaconIntervalMs = previousBeaconIntervalMs;
+            Serial.println("[mesh] failed to save configuration");
+          }
+        }
       } else if (nodeSerialCommand == "mesh show") {
-        Serial.printf("[mesh] channel=%u sensor_interval_s=%lu beacon_interval_ms=%lu missed_sync=%u\n",
-                      runtimeMeshChannel, static_cast<unsigned long>(runtimeSensorIntervalMs / 1000UL),
-                      static_cast<unsigned long>(runtimeBeaconIntervalMs), missedSyncCount);
+        Serial.printf("[mesh] channel=%u sensor_interval_ms=%lu beacon_interval_ms=%lu active_window_ms=%lu missed_sync=%u\n",
+                      runtimeMeshChannel, static_cast<unsigned long>(runtimeSensorIntervalMs),
+                      static_cast<unsigned long>(runtimeBeaconIntervalMs),
+                      static_cast<unsigned long>(runtimeActiveWindowMs), missedSyncCount);
       }
       nodeSerialCommand = "";
     } else if (nodeSerialCommand.length() < 96) nodeSerialCommand += c;
@@ -1476,6 +1536,36 @@ void setup() {
   }
 #endif
   WiFi.mode(WIFI_STA);
+  // Broadcast ESP-NOW beacons on the configured mesh channel before Wi-Fi
+  // associates.  Nodes that are awake in this window will learn the timing
+  // and channel from the gateway without having to wait for the full Wi-Fi
+  // connect / NTP cycle (which can take up to 30 s + NTP sync).
+  {
+    const uint8_t preWifiChannel = runtimeMeshChannel;
+    gatewayRadioChannel = preWifiChannel;
+    if (initEspNow(preWifiChannel)) {
+      esp_now_register_recv_cb(onGatewayReceive);
+      Serial.printf("[gateway] pre-WiFi ESP-NOW beacons on channel=%u\n", preWifiChannel);
+      const uint32_t preBeaconEnd = millis() + 2000UL;  // 2 s window
+      gatewayNextWindowAt     = millis() + runtimeSensorIntervalMs;
+      gatewayNextSensorSlotAt = gatewayNextWindowAt;
+      gatewayWindowOpenedAt   = 0;
+      gatewayWindowActive     = false;
+      gatewayNextBeaconAt     = millis();
+      while (static_cast<int32_t>(preBeaconEnd - millis()) > 0) {
+        if (static_cast<int32_t>(millis() - gatewayNextBeaconAt) >= 0) {
+          sendSyncBeacon(false);
+          gatewayNextBeaconAt += runtimeBeaconIntervalMs;
+          if (static_cast<int32_t>(millis() - gatewayNextBeaconAt) >= 0)
+            gatewayNextBeaconAt = millis() + runtimeBeaconIntervalMs;
+        }
+        delay(5);
+      }
+      esp_now_deinit();
+      gatewayRadioChannel = 0;  // Will be set properly after Wi-Fi/channel resolution below.
+      Serial.println("[gateway] pre-WiFi beacon window done");
+    }
+  }
   if (wifiConfig.ssid.isEmpty()) {
     Serial.println("[wifi] no profile configured; use 'wifi set ...' then 'wifi save' and 'wifi apply'");
   } else if (beginWifi()) {

@@ -61,9 +61,9 @@ inline bool isValidSyncBeacon(const uint8_t *data, size_t len) {
          beacon->channel >= 1 && beacon->channel <= 13 &&
          beacon->next_channel >= 1 && beacon->next_channel <= 13 &&
          beacon->channel_switch_delay_ms <= 60000 &&
-         beacon->sensor_interval_ms >= 10000 && beacon->sensor_interval_ms <= 86400000UL &&
-         beacon->beacon_interval_ms >= 100 && beacon->beacon_interval_ms <= 60000 &&
-         beacon->active_window_ms >= 500 && beacon->active_window_ms <= 10000 &&
+         beacon->sensor_interval_ms >= 500 && beacon->sensor_interval_ms <= 86400000UL &&
+         beacon->beacon_interval_ms >= 100 && beacon->beacon_interval_ms <= 30000 &&
+         beacon->active_window_ms >= 200 && beacon->active_window_ms <= 86400000UL &&
          beacon->sensor_interval_ms > beacon->active_window_ms &&
          beacon->beacon_interval_ms <= beacon->active_window_ms / 2 &&
          beacon->remaining_sleep_ms <= beacon->sensor_interval_ms &&
