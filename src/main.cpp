@@ -71,6 +71,7 @@ void onNodeReceive(const esp_now_recv_info_t *, const uint8_t *, int);
 void serviceNodeMesh();
 void onSampleSend(const esp_now_send_info_t *, esp_now_send_status_t);
 bool publishSample();
+void queueUnsentSample(const TelemetryPacket &packet);
 #endif
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
 bool sendSyncBeacon(bool windowOpen);
@@ -217,9 +218,12 @@ uint32_t lastChannelScanMs = 0;
 uint32_t nodeNextSlotAt = 0;
 uint32_t nodeTransmitAt = 0;
 uint32_t nodeWakeStartedMs = 0;
+uint32_t nodeFallbackTransmitAt = 0;
 uint32_t nodeWindowStartedAt = 0;
 uint32_t nodeWindowEndsAt = 0;
 uint32_t nodeInitialJitterMs = 0;
+RTC_DATA_ATTR TelemetryPacket unsentSamples[8]{};
+RTC_DATA_ATTR uint8_t unsentSampleCount = 0;
 RTC_DATA_ATTR bool channelSwitchPending = false;
 RTC_DATA_ATTR uint8_t channelSwitchTarget = 0;
 uint32_t channelSwitchAt = 0;
@@ -242,7 +246,6 @@ constexpr uint32_t GATEWAY_CHANNEL_ANNOUNCE_MS = 15000;
 #endif
 
 String deviceId() {
-  if (strlen(NODE_ID) > 0) return String(NODE_ID);
   uint8_t mac[6] = {};
   // Reads the eFuse MAC; unlike WiFi.macAddress() this works before WiFi.mode().
   if (esp_read_mac(mac, ESP_MAC_WIFI_STA) != ESP_OK) return String("node-unknown");
@@ -987,6 +990,16 @@ void serviceNodeMesh() {
     if (publishSample()) nodeSentThisWindow = true;
     else nodeTransmitAt = millis() + 250UL;
   }
+  if (nodeSynced && nodeWindowOpen && !nodeSentThisWindow &&
+      static_cast<int32_t>(now - nodeWindowEndsAt) >= 0) {
+    queueUnsentSample(collectTelemetry());
+    nodeSentThisWindow = true;
+  }
+  // No beacon yet: still take a reading instead of staying silent.
+  if (!nodeSynced && nodeRadioReady && static_cast<int32_t>(now - nodeFallbackTransmitAt) >= 0) {
+    publishSample();
+    nodeFallbackTransmitAt = millis() + runtimeSensorIntervalMs;
+  }
   if (nodeSynced && nodeWindowOpen && static_cast<int32_t>(now - nodeWindowEndsAt) >= 0) {
     nodeWindowOpen = false;
   }
@@ -1100,8 +1113,9 @@ void onSampleSend(const esp_now_send_info_t *, esp_now_send_status_t status) {
   if (status == ESP_NOW_SEND_SUCCESS) blinkStatusLed(1);
 }
 
-bool publishSample() {
-  const TelemetryPacket packet = collectTelemetry();
+void queueUnsentSample(const TelemetryPacket &packet);
+
+bool transmitPacket(const TelemetryPacket &packet) {
   if (nodeConsoleEnabled) {
     Serial.printf("[sensor] id=%s seq=%lu lux=", packet.nodeId,
                 static_cast<unsigned long>(packet.sequence));
@@ -1129,6 +1143,31 @@ bool publishSample() {
   const bool sent = sampleSendDone && sampleSendStatus == ESP_NOW_SEND_SUCCESS;
   if (nodeConsoleEnabled) Serial.printf("[sensor] ESP-NOW callback=%s\n", sent ? "success" : "failure/timeout");
   return sent;
+}
+
+void queueUnsentSample(const TelemetryPacket &packet) {
+  if (unsentSampleCount == sizeof(unsentSamples) / sizeof(unsentSamples[0])) {
+    memmove(unsentSamples, unsentSamples + 1, sizeof(unsentSamples[0]) * (unsentSampleCount - 1));
+    --unsentSampleCount;
+  }
+  unsentSamples[unsentSampleCount++] = packet;
+}
+
+bool publishSample() {
+  bool sent = true;
+  for (uint8_t i = 0; i < unsentSampleCount; ++i) {
+    if (!transmitPacket(unsentSamples[i])) { sent = false; break; }
+    memmove(unsentSamples + i, unsentSamples + i + 1, sizeof(unsentSamples[0]) * (unsentSampleCount - i - 1));
+    --unsentSampleCount;
+    --i;
+  }
+  const TelemetryPacket packet = collectTelemetry();
+  if (!transmitPacket(packet)) {
+    queueUnsentSample(packet);
+    return false;
+  }
+  if (!sent) return false;
+  return true;
 }
 #endif
 
@@ -1465,29 +1504,16 @@ void publishPacket(const TelemetryPacket &packet, const uint8_t *sourceMac, int8
   gatewayLastLuxValid = (packet.flags & FLAG_LUX_VALID) != 0;
   gatewayLastLux = gatewayLastLuxValid ? packet.luxCenti / 100.0f : NAN;
   JsonDocument doc;
-  doc["schema"] = 3;
-  doc["node_id"] = packet.nodeId;
-  doc["from"] = packet.from;
-  doc["sensor_interval_ms"] = runtimeSensorIntervalMs;
-  doc["beacon_interval_ms"] = runtimeBeaconIntervalMs;
-  doc["active_window_ms"] = runtimeActiveWindowMs;
-  doc["sequence"] = packet.sequence;
-  doc["uptime_ms"] = packet.uptimeMs;
-  doc["hop"] = packet.hop;
-  doc["relayed"] = (packet.flags & FLAG_RELAYED) != 0;
-  doc["rssi_dbm"] = rssi;
-  doc["gateway_rx_epoch"] = static_cast<uint32_t>(time(nullptr));
-  char mac[18];
-  snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
-           sourceMac[0], sourceMac[1], sourceMac[2], sourceMac[3], sourceMac[4], sourceMac[5]);
-  doc["source_mac"] = mac;
-  if (packet.flags & FLAG_LUX_VALID) doc["lux_lx"] = packet.luxCenti / 100.0f;
-  if (packet.flags & FLAG_NTC_VALID) doc["battery_temp_c"] = packet.batteryTempCentiC / 100.0f;
-  if (packet.flags & FLAG_BATTERY_VALID) doc["battery_v"] = packet.batteryMilliVolts / 1000.0f;
-  if (packet.flags & FLAG_WIND_VALID) doc["wind_input_v"] = packet.windMilliVolts / 1000.0f;
-  char payload[384];
+  if (packet.flags & FLAG_LUX_VALID) doc["lx"] = packet.luxCenti / 100.0f;
+  if (packet.flags & FLAG_NTC_VALID) doc["tc"] = packet.batteryTempCentiC / 100.0f;
+  if (packet.flags & FLAG_BATTERY_VALID) doc["bv"] = packet.batteryMilliVolts / 1000.0f;
+  if (packet.flags & FLAG_WIND_VALID) doc["wv"] = packet.windMilliVolts / 1000.0f;
+  doc["s"] = packet.sequence;
+  doc["h"] = packet.hop;
+  doc["r"] = rssi;
+  char payload[192];
   const size_t len = serializeJson(doc, payload, sizeof(payload));
-  const String topic = mqttTopicPrefix + "/" + packet.nodeId + "/state";
+  const String topic = mqttTopicPrefix + "/" + String(packet.nodeId).substring(5) + "/state";
   if (mqttClient.connected()) {
     const bool ok = mqttClient.publish(topic.c_str(), reinterpret_cast<const uint8_t *>(payload), len, false);
     Serial.printf("[gateway] %s topic=%s payload=%s\n", ok ? "published" : "publish failed", topic.c_str(), payload);

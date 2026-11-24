@@ -111,14 +111,16 @@ Image `sensor-relay` mengukur sekaligus meneruskan paket untuk mendukung node se
 
 Paket radio telemetri berversi membawa ID node sumber, pemancar langsung terakhir (`from`), nomor urut, uptime, hop, TTL, flags validitas, lux (centilux), suhu (centi-°C), dan tegangan (mV). Beacon sinkronisasi membawa channel, sensor interval, beacon interval, active window, dan ID gateway asal (`fromId`); relay mengadopsi lalu meneruskan beacon pertama per sequence dengan TTL terbatas, sehingga node yang hanya mendengar relay tetap tahu jadwal berasal dari gateway. Gateway melakukan validasi ukuran/header dan deduplikasi sederhana, lalu menerbitkan:
 
-- `<prefix>/<node_id>/state` — JSON telemetri
+- `<prefix>/<mac-12-hex>/state` — JSON telemetri
 - `<prefix>/gateway/status` — retained `online`/`offline`
 
 Prefix default `unesa/ussc/sensor`. Contoh JSON:
 
 ```json
-{"schema":3,"node_id":"node-7C9EBD123456","from":"node-AABBCCDDEEFF","sensor_interval_ms":300000,"beacon_interval_ms":1000,"active_window_ms":3000,"sequence":3,"uptime_ms":125430,"hop":1,"relayed":true,"rssi_dbm":-52,"gateway_rx_epoch":1795171200,"source_mac":"7C:9E:BD:65:43:21","lux_lx":245.5,"battery_temp_c":31.2,"battery_v":3.91}
+{"lx":245.5,"tc":31.2,"bv":3.91,"s":3,"h":1,"r":-52}
 ```
+
+Node ID menggunakan 12 digit heksadesimal MAC pada topik (tanpa pemisah). Payload hanya membawa pembacaan valid dan sequence/hop/RSSI; identitas node tidak diulang di JSON. Dashboard menampilkan hingga 100 sampel terakhir yang diterima selama halaman terbuka.
 
 **Relay/multi-hop dasar sudah diprogram**, tetapi ini bukan mesh routing otomatis atau protokol yang teruji ketahanan. Firmware menambahkan deduplikasi, jitter acak, hop, dan TTL. Pengiriman broadcast tetap best-effort; topologi, jumlah node, kehilangan paket, duplikasi, interferensi, dan jangkauan harus diuji sebelum menarik kesimpulan.
 
@@ -153,7 +155,7 @@ Workflow `.github/workflows/pages.yml` membangun firmware sensor/relay dan gatew
 - Tegangan dinamo anemometer wajib dikondisikan/proteksi dan dibatasi sebelum pin ADC; uji tegangan maksimum dan transien secara aman.
 - Baterai dan charger solar memerlukan tinjauan listrik/termal terpisah; jangan gunakan susunan TP4056 pada panel 6 V tanpa memastikan batas input dan kebutuhan charger solar.
 - Estimasi ketahanan baterai belum dapat dinyatakan sebelum arus sistem, siklus sampling, panel, kapasitas sel, dan kondisi pencahayaan diuji.
-- Deep sleep diaktifkan secara default pada image sensor-relay; perangkat hanya mendengarkan/merelay selama active window terjadwal, lalu tidur. Untuk relay yang harus selalu mendengarkan, nonaktifkan `NODE_DEEP_SLEEP` saat build dan uji konsumsi dayanya.
+- Deep sleep diaktifkan secara default pada image sensor-relay; perangkat hanya mendengarkan/merelay selama active window terjadwal, lalu tidur. Saat belum menerima beacon sync, sensor tetap mencoba mengirim pada interval sensor; kegagalan transmit disimpan di RTC RAM (maksimal 8 sampel, hilang saat daya benar-benar terputus) dan dicoba ulang/bulk saat kesempatan kirim berikutnya. Untuk relay yang harus selalu mendengarkan, nonaktifkan `NODE_DEEP_SLEEP` saat build dan uji konsumsi dayanya.
 - Gateway queue bersifat RAM/best-effort; pesan dapat hilang jika broker putus atau queue penuh. Mekanisme ini belum memiliki store-and-forward.
 - Relay sederhana tidak menjamin pengiriman, routing optimal, atau pemulihan rute; TTL dan deduplikasi hanya batas dasar.
 - Target kinerja numerik ditetapkan setelah komponen, lingkungan, jumlah node, dan metode uji disepakati.
