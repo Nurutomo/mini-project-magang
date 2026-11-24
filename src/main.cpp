@@ -1,4 +1,8 @@
 #include <Arduino.h>
+#include "config.h"
+#include "telemetry.h"
+#include "runtime.h"
+
 #include <WiFi.h>
 #include <Preferences.h>
 #include <Wire.h>
@@ -6,17 +10,13 @@
 #include <esp_wifi.h>
 #include <esp_sleep.h>
 #include <esp_mac.h>
-#if CONFIG_IDF_TARGET_ESP32C3
-#include <driver/usb_serial_jtag.h>
-#endif
 #include <math.h>
 #include <stddef.h>
 #include <string.h>
 #include <ArduinoJson.h>
-
-#include "config.h"
-#include "telemetry.h"
-
+#if CONFIG_IDF_TARGET_ESP32C3
+#include <driver/usb_serial_jtag.h>
+#endif
 #if defined(DEVICE_ROLE_GATEWAY) && DEVICE_ROLE_GATEWAY
 #include <PubSubClient.h>
 #include <WiFiClient.h>
@@ -32,14 +32,6 @@ namespace {
 constexpr uint8_t BROADCAST_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 constexpr uint32_t SENSOR_SETTLE_MS = 4;
 
-#if STATUS_LED_PIN >= 0
-volatile uint8_t statusLedPendingPulses = 0;
-portMUX_TYPE statusLedMux = portMUX_INITIALIZER_UNLOCKED;
-bool statusLedOn = false;
-bool statusLedGap = false;
-uint32_t statusLedNextTransitionMs = 0;
-#endif
-
 uint8_t runtimeMeshChannel = ESPNOW_CHANNEL;
 uint32_t runtimeSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
 uint32_t runtimeBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
@@ -52,17 +44,6 @@ bool serialConsoleConnected() {
   return true; // UART-connected boards have no reliable host-presence signal.
 #endif
 }
-
-void initStatusLed() {
-#if STATUS_LED_PIN >= 0
-  pinMode(STATUS_LED_PIN, OUTPUT);
-  digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
-#endif
-}
-
-void loadMeshConfig();
-bool saveMeshConfig();
-void configureMaxTxPower();
 
 #if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
 void pollNodeSerial();
@@ -81,45 +62,13 @@ void configureMaxTxPower();
 extern uint8_t gatewayRadioChannel;
 #endif
 
-void blinkStatusLed(uint8_t pulses = 1) {
-#if STATUS_LED_PIN >= 0
-  portENTER_CRITICAL(&statusLedMux);
-  const uint16_t queued = static_cast<uint16_t>(statusLedPendingPulses) + pulses;
-  statusLedPendingPulses = static_cast<uint8_t>(queued > 20 ? 20 : queued);
-  portEXIT_CRITICAL(&statusLedMux);
-#else
-  (void)pulses;
-#endif
-}
-
-void serviceStatusLed() {
-#if STATUS_LED_PIN >= 0
-  const uint32_t now = millis();
-  if (statusLedOn && static_cast<int32_t>(now - statusLedNextTransitionMs) >= 0) {
-    digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? LOW : HIGH);
-    statusLedOn = false;
-    statusLedGap = true;
-    statusLedNextTransitionMs = now + 45;
-  }
-  if (!statusLedOn && statusLedPendingPulses &&
-      (!statusLedGap || static_cast<int32_t>(now - statusLedNextTransitionMs) >= 0)) {
-    portENTER_CRITICAL(&statusLedMux);
-    if (statusLedPendingPulses) --statusLedPendingPulses;
-    portEXIT_CRITICAL(&statusLedMux);
-    digitalWrite(STATUS_LED_PIN, STATUS_LED_ACTIVE_HIGH ? HIGH : LOW);
-    statusLedOn = true;
-    statusLedGap = false;
-    statusLedNextTransitionMs = now + 70;
-  }
-#endif
-}
-
 RTC_DATA_ATTR uint8_t rtcMeshChannel = ESPNOW_CHANNEL;
 RTC_DATA_ATTR uint32_t rtcSensorIntervalMs = SAMPLE_INTERVAL_S * 1000UL;
 RTC_DATA_ATTR uint32_t rtcBeaconIntervalMs = SYNC_BEACON_INTERVAL_MS;
 RTC_DATA_ATTR uint32_t rtcActiveWindowMs = NODE_ACTIVE_WINDOW_MS;
 RTC_DATA_ATTR uint32_t lastSyncSleepMs = 0;
 RTC_DATA_ATTR uint16_t missedSyncCount = 0;
+RTC_DATA_ATTR bool rtcNodeSynced = false;
 
 struct __attribute__((packed)) MeshConfigRecord {
   uint8_t version;
@@ -895,6 +844,7 @@ void applyPendingSyncBeacon() {
     nodeTransmitAt = nodeNextSlotAt + jitter;
   }
   nodeSynced = true;
+  rtcNodeSynced = true;
   nodeWakeStartedMs = now;
   channelScanCandidate = beacon.channel;
   rtcMeshChannel = beacon.channel;
@@ -1017,7 +967,8 @@ void serviceNodeMesh() {
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
     esp_deep_sleep_start();
   }
-  if (!nodeSynced && now - nodeWakeStartedMs >= awakeLimit) {
+  if (!nodeSynced && now - nodeWakeStartedMs >= awakeLimit &&
+      (unsentSampleCount == 0 || static_cast<int32_t>(now - nodeFallbackTransmitAt) < 0)) {
     if (nodeConsoleEnabled) return;
     if (nodeRadioReady) { esp_now_deinit(); nodeRadioReady = false; }
     WiFi.mode(WIFI_OFF);
@@ -1576,9 +1527,11 @@ void setup() {
   const esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
   if (wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
     nodeSynced = false;
+    rtcNodeSynced = false;
     missedSyncCount = 0;
     channelScanCandidate = runtimeMeshChannel;
   } else {
+    nodeSynced = rtcNodeSynced;
     runtimeMeshChannel = rtcMeshChannel;
     runtimeSensorIntervalMs = rtcSensorIntervalMs;
     runtimeBeaconIntervalMs = rtcBeaconIntervalMs;
@@ -1612,10 +1565,16 @@ void setup() {
 #endif
     Serial.printf(" samples=%u\n", ADC_SAMPLES);
   }
-  nodeSynced = false;
-  nodeWindowOpen = false;
+  nodeSynced = wakeCause == ESP_SLEEP_WAKEUP_TIMER && rtcNodeSynced;
+  nodeWindowOpen = nodeSynced;
   nodeSentThisWindow = false;
   nodeWakeStartedMs = millis();
+  if (nodeSynced) {
+    nodeWindowStartedAt = nodeWakeStartedMs;
+    nodeWindowEndsAt = nodeWakeStartedMs + runtimeActiveWindowMs;
+    nodeNextSlotAt = nodeWindowEndsAt;
+    nodeTransmitAt = nodeWakeStartedMs + nodeInitialJitterMs + static_cast<uint32_t>(random(5, 25));
+  }
   if (initEspNow(nodeRadioChannel)) {
     nodeRadioReady = true;
     esp_now_register_send_cb(onSampleSend);
@@ -1726,15 +1685,10 @@ void loop() {
   serviceNodeMesh();
 #endif
 #if defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY && ESPNOW_ENABLE_RELAY
-#if defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR
-  if (nodeWindowOpen) {
-    relayQueuedPackets();
-    relayQueuedBeacons();
-  }
-#else
+  // Relaying must not depend on a gateway sync beacon: an unsynchronized relay
+  // still forwards queued telemetry/beacons while its radio is awake.
   relayQueuedPackets();
   relayQueuedBeacons();
-#endif
 #endif
 #if (defined(DEVICE_ROLE_SENSOR) && DEVICE_ROLE_SENSOR) || (defined(DEVICE_ROLE_RELAY) && DEVICE_ROLE_RELAY)
   delay(5);
