@@ -99,6 +99,7 @@ jobs:
         run: |
           set -euo pipefail
           cp web/index.html dist/index.html
+          cp web/app.js web/favicon.svg dist/
           printf '{"commit":"%s","builtAt":"%s"}\n' "${GITHUB_SHA::7}" "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > dist/commit.json
           for env in gateway-esp32c3 gateway-esp32classic sensor-relay-esp32c3 sensor-relay-esp32classic; do
             if [[ "$env" == *esp32c3 ]]; then
