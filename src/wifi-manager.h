@@ -15,6 +15,7 @@ void loadWifiConfig();
 bool beginWifi();
 String wifiSsid();
 bool wifiIsEnterprise();
+WifiProfile currentWifiProfile();
 void normalizeWifiProfile();
 void setWifiProfile(const WifiProfile &profile);
 bool wifiProfileIsEmpty();

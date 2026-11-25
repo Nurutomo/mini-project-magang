@@ -975,7 +975,23 @@ bool sendSyncBeacon(bool windowOpen) {
 }
 
 void processGatewayPacket(const TelemetryPacket &packet, int8_t rssi) {
-  if (duplicatePacket(packet)) return;
+  if (duplicatePacket(packet)) {
+    Serial.printf("[gateway] duplicate node=%s seq=%lu ignored\n",
+                  packet.nodeId, static_cast<unsigned long>(packet.sequence));
+    return;
+  }
+  Serial.printf("[gateway] received node=%s seq=%lu from=%s rssi=%d dBm hop=%u ttl=%u",
+                packet.nodeId, static_cast<unsigned long>(packet.sequence), packet.from,
+                static_cast<int>(rssi), packet.hop, packet.ttl);
+  if (packet.flags & FLAG_LUX_VALID)
+    Serial.printf(" lux=%.2f lx", packet.luxCenti / 100.0f);
+  if (packet.flags & FLAG_NTC_VALID)
+    Serial.printf(" temp=%.2f C", packet.batteryTempCentiC / 100.0f);
+  if (packet.flags & FLAG_BATTERY_VALID)
+    Serial.printf(" battery=%.3f V", packet.batteryMilliVolts / 1000.0f);
+  if (packet.flags & FLAG_WIND_VALID)
+    Serial.printf(" wind=%.3f V", packet.windMilliVolts / 1000.0f);
+  Serial.println();
   NodeDisplayInfo *nodeInfo = nullptr;
   for (auto &node : gatewayNodes) {
     if (node.seen && strncmp(node.packet.nodeId, packet.nodeId, NODE_ID_MAX_LEN) == 0) { nodeInfo = &node; break; }
@@ -1175,6 +1191,7 @@ void setup() {
     markNtpSyncStarted();
     Serial.printf("[time] NTP sync started; valid=%s\n", currentTimeValid() ? "yes" : "no");
   } else {
+    lastWifiReconnectAttempt = millis();
     gatewayRadioChannel = ESPNOW_CHANNEL;
     Serial.printf("[gateway] Wi-Fi unavailable; ESP-NOW channel=%u; MQTT disabled until Wi-Fi joins\n", gatewayRadioChannel);
   }
@@ -1304,9 +1321,11 @@ void loop() {
       gatewayNextBeaconAt = meshNow + runtimeBeaconIntervalMs;
   }
   if (takeWifiApplyRequest()) {
-    disconnectMqtt(); WiFi.disconnect(false, false); delay(100);
+    disconnectMqtt();
+    if (WiFi.status() == WL_CONNECTED) { WiFi.disconnect(false, false); delay(100); }
     normalizeWifiProfile();
     if (beginWifi()) {
+      Serial.printf("[wifi] connecting SSID=%s; waiting up to 30s\n", wifiSsid().c_str());
       uint32_t started = millis();
       while (WiFi.status() != WL_CONNECTED && millis() - started < 30000) delay(250);
       if (WiFi.status() == WL_CONNECTED) {
@@ -1322,7 +1341,7 @@ void loop() {
         configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
         markNtpSyncStarted();
         Serial.printf("[wifi] connected IP=%s channel=%u; NTP and ESP-NOW restarted\n", WiFi.localIP().toString().c_str(), gatewayRadioChannel);
-      } else Serial.println("[wifi] failed; check credentials and 2.4 GHz coverage");
+      } else Serial.println("[wifi] failed; see the reason code above (SSID coverage vs. credentials)");
     }
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -1348,9 +1367,14 @@ void loop() {
     reconnectMqtt();
   } else {
     gatewayWifiWasConnected = false;
-    if (!wifiProfileIsEmpty() && millis() - lastWifiReconnectAttempt >= 15000) {
+    // Only re-issue a connection once the driver reports a finished (failed)
+    // attempt; disconnecting mid-attempt aborts otherwise healthy retries.
+    const wl_status_t wifiStatus = WiFi.status();
+    const bool attemptFinished = wifiStatus != WL_IDLE_STATUS &&
+        wifiStatus != WL_SCAN_COMPLETED && wifiStatus != WL_CONNECTED;
+    if (!wifiProfileIsEmpty() && attemptFinished &&
+        millis() - lastWifiReconnectAttempt >= 15000) {
       lastWifiReconnectAttempt = millis();
-      WiFi.disconnect(false, false);
       beginWifi();
     }
   }

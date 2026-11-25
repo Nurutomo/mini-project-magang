@@ -32,11 +32,12 @@ void pollSerialCommands() {
         Serial.println("mqtt topic <prefix> | mqtt show | mqtt save | mqtt clear");
         Serial.println("Fields are space-separated. Your serial terminal may echo typed credentials.");
       } else {
-        WifiProfile profile{};
-        profile.ssid = wifiSsid();
-        profile.enterprise = wifiIsEnterprise();
+        WifiProfile profile = currentWifiProfile();
         if (serialCommand == "wifi show") {
-          Serial.printf("[wifi] SSID=%s auth=%s password=[hidden]\n", profile.ssid.c_str(), profile.enterprise ? "PEAP" : "PSK");
+          Serial.printf("[wifi] SSID=%s auth=%s password=%s ca=%s\n",
+                        profile.ssid.c_str(), profile.enterprise ? "PEAP" : "PSK",
+                        profile.password.isEmpty() ? "missing" : "set",
+                        profile.caCert.isEmpty() ? "none" : "set");
         } else if (serialCommand == "wifi save") {
           if (wifiProfileIsEmpty()) {
             Serial.println("[wifi] set a profile first");
@@ -45,6 +46,8 @@ void pollSerialCommands() {
             setWifiProfile(profile);
             saveWifiProfile();
             Serial.println("[wifi] profile saved in NVS");
+            if (profile.password.isEmpty())
+              Serial.println("[wifi] warning: password is empty; only open networks will connect");
           }
         } else if (serialCommand == "wifi clear") {
           clearSavedWifiProfile();
