@@ -912,9 +912,33 @@ GatewayDisplaySnapshot gatewayDisplaySnapshot() {
           gatewayRxCount, queueDropped, WiFi.status() == WL_CONNECTED, mqttConnected()};
 }
 
+void logGatewayPacket(const TelemetryPacket &packet, int8_t rssi, const char *status) {
+  Serial.printf("[gateway] %s node=%s seq=%lu from=%s rssi=%d dBm hop=%u ttl=%u",
+                status, packet.nodeId, static_cast<unsigned long>(packet.sequence), packet.from,
+                static_cast<int>(rssi), packet.hop, packet.ttl);
+  if (packet.flags & FLAG_LUX_VALID)
+    Serial.printf(" lux=%.2f lx", packet.luxCenti / 100.0f);
+  if (packet.flags & FLAG_NTC_VALID)
+    Serial.printf(" temp=%.2f C", packet.batteryTempCentiC / 100.0f);
+  if (packet.flags & FLAG_BATTERY_VALID)
+    Serial.printf(" battery=%.3f V", packet.batteryMilliVolts / 1000.0f);
+  if (packet.flags & FLAG_WIND_VALID)
+    Serial.printf(" wind=%.3f V", packet.windMilliVolts / 1000.0f);
+  Serial.println();
+}
+
 void onGatewayReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-  if (!info || !info->src_addr || !isValidTelemetryPacket(data, static_cast<size_t>(len))) {
+  if (!info || !info->src_addr || !data || len <= 0) {
     ++invalidPackets;
+    Serial.println("[gateway] dropped invalid frame: no payload");
+    return;
+  }
+  // Relayed gateway beacons arrive here too; they are not telemetry.
+  if (isValidSyncBeacon(data, static_cast<size_t>(len))) return;
+  if (!isValidTelemetryPacket(data, static_cast<size_t>(len))) {
+    ++invalidPackets;
+    Serial.printf("[gateway] dropped invalid frame len=%d magic=0x%02X version=%u\n",
+                  len, data[0], len > 1 ? static_cast<unsigned>(data[1]) : 0u);
     return;
   }
   blinkStatusLed(1);
@@ -927,6 +951,8 @@ void onGatewayReceive(const esp_now_recv_info_t *info, const uint8_t *data, int 
   if (next == queueTail) {
     ++queueDropped;
     portEXIT_CRITICAL(&queueMux);
+    // Log the contents here: this packet never reaches processGatewayPacket().
+    logGatewayPacket(item.packet, item.rssi, "dropped queue-full");
     return;
   }
   queueItems[queueHead] = item;
@@ -976,22 +1002,10 @@ bool sendSyncBeacon(bool windowOpen) {
 
 void processGatewayPacket(const TelemetryPacket &packet, int8_t rssi) {
   if (duplicatePacket(packet)) {
-    Serial.printf("[gateway] duplicate node=%s seq=%lu ignored\n",
-                  packet.nodeId, static_cast<unsigned long>(packet.sequence));
+    logGatewayPacket(packet, rssi, "dropped duplicate");
     return;
   }
-  Serial.printf("[gateway] received node=%s seq=%lu from=%s rssi=%d dBm hop=%u ttl=%u",
-                packet.nodeId, static_cast<unsigned long>(packet.sequence), packet.from,
-                static_cast<int>(rssi), packet.hop, packet.ttl);
-  if (packet.flags & FLAG_LUX_VALID)
-    Serial.printf(" lux=%.2f lx", packet.luxCenti / 100.0f);
-  if (packet.flags & FLAG_NTC_VALID)
-    Serial.printf(" temp=%.2f C", packet.batteryTempCentiC / 100.0f);
-  if (packet.flags & FLAG_BATTERY_VALID)
-    Serial.printf(" battery=%.3f V", packet.batteryMilliVolts / 1000.0f);
-  if (packet.flags & FLAG_WIND_VALID)
-    Serial.printf(" wind=%.3f V", packet.windMilliVolts / 1000.0f);
-  Serial.println();
+  logGatewayPacket(packet, rssi, "received");
   NodeDisplayInfo *nodeInfo = nullptr;
   for (auto &node : gatewayNodes) {
     if (node.seen && strncmp(node.packet.nodeId, packet.nodeId, NODE_ID_MAX_LEN) == 0) { nodeInfo = &node; break; }
