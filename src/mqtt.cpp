@@ -68,9 +68,10 @@ void publishPacket(const TelemetryPacket &packet, int8_t rssi) {
   doc["s"] = packet.sequence;
   doc["h"] = packet.hop;
   doc["r"] = rssi;
-  char payload[192];
+  doc["node"] = packet.nodeId;  // Originating sensor; topic identifies the last transmitter.
+  char payload[224];
   const size_t len = serializeJson(doc, payload, sizeof(payload));
-  const String topic = mqttTopicPrefix + "/" + String(packet.nodeId).substring(5) + "/state";
+  const String topic = mqttTopicPrefix + "/" + String(packet.from).substring(5) + "/state";
   if (mqttClient.connected()) {
     const bool ok = mqttClient.publish(topic.c_str(), reinterpret_cast<const uint8_t *>(payload), len, false);
     Serial.printf("[gateway] %s topic=%s payload=%s\n", ok ? "published" : "publish failed", topic.c_str(), payload);
